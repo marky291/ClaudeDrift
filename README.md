@@ -63,6 +63,11 @@ Or install it as a plugin:
 
 That's it. Point it at any repo that uses Claude artifacts and run the command.
 
+> **Featherweight.** ClaudeDrift adds **~250 tokens** to a session — it's a single
+> on-demand command plus one auditor agent, with **no MCP server and no always-on
+> hooks**. The expensive semantic pass only runs when you ask it to. Install costs
+> you almost nothing until you use it.
+
 ## What it looks like
 
 Run against a real production repo (a Laravel app with **13** Claude artifacts):
