@@ -1,0 +1,18 @@
+{
+  "name": "claude-drift-marketplace",
+  "metadata": {
+    "description": "Marketplace for ClaudeDrift — keeps a project's Claude artifacts aligned with its actual codebase."
+  },
+  "owner": {
+    "name": "Mark Hester",
+    "email": "markhester.dev+anthropic@pm.me"
+  },
+  "plugins": [
+    {
+      "name": "claude-drift",
+      "source": "./",
+      "description": "Detects and fixes drift between a project's Claude artifacts and its actual current reality.",
+      "version": "0.1.0"
+    }
+  ]
+}
