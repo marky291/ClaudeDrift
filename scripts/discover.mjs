@@ -160,10 +160,21 @@ function buildContext(root) {
     ? makeText.split("\n").map((l) => l.match(/^([A-Za-z0-9:_-]+):(?!=)/)).filter(Boolean).map((m) => m[1])
     : null;
 
+  // Justfile: recipes (incl. parameters & dependencies) + aliases. If the justfile
+  // imports modules we can't resolve them, so just-recipe findings are downgraded.
   const justText = readText(path.join(root, "justfile")) || readText(path.join(root, "Justfile"));
-  const justRecipes = justText
-    ? justText.split("\n").map((l) => l.match(/^([a-zA-Z0-9_-]+)\s*:/)).filter(Boolean).map((m) => m[1])
-    : null;
+  let justRecipes = null, justHasModules = false;
+  if (justText != null) {
+    justRecipes = [];
+    for (const raw of justText.split("\n")) {
+      if (/^\s*(import|mod)\b/.test(raw)) justHasModules = true;
+      const alias = raw.match(/^\s*alias\s+([A-Za-z0-9_-]+)\s*:=/);
+      if (alias) { justRecipes.push(alias[1]); continue; }
+      if (/^\s/.test(raw) || /^[#@\[]/.test(raw) || /^(set|export)\b/.test(raw)) continue; // body/attr/setting
+      const m = raw.match(/^@?([A-Za-z0-9_-]+)(?:\s+[^:]*?)?:(?!=)/); // name [params...] [: deps]
+      if (m) justRecipes.push(m[1]);
+    }
+  }
 
   // Laravel Envoy tasks/stories.
   const envoyText = readText(path.join(root, "Envoy.blade.php"));
@@ -179,9 +190,9 @@ function buildContext(root) {
     ? new Set(envText.split("\n").map((l) => l.match(/^([A-Z][A-Z0-9_]+)=/)).filter(Boolean).map((m) => m[1]))
     : null;
 
-  // Real top-level directories of THIS project — the language-agnostic way to
-  // tell "looks like a project path" from prose/branch-names/import-paths,
-  // instead of a hardcoded src/app/lib allowlist that only fits PHP/JS layouts.
+  // Real top-level directories of THIS project — the language-agnostic way to tell
+  // a project path from prose/branch-names/import-paths, instead of a hardcoded
+  // src/app/lib allowlist that only fits PHP/JS layouts.
   let topDirs = new Set();
   try {
     topDirs = new Set(
@@ -201,12 +212,54 @@ function buildContext(root) {
     composerScripts: composer && composer.scripts ? Object.keys(composer.scripts) : null,
     makeTargets,
     justRecipes,
+    justHasModules,
     envoyTasks,
     envKeys,
+    isIgnored: buildGitignoreMatcher(root),
     topDirs,
     submodulePaths,
   };
 }
+
+// Practical .gitignore matcher (common subset: anchored & unanchored patterns,
+// trailing-slash dirs, *, **, ?). Used to suppress references to files that are
+// intentionally absent (secrets, local settings, build output, caches).
+function buildGitignoreMatcher(root) {
+  const txt = readText(path.join(root, ".gitignore"));
+  if (!txt) return () => false;
+  // Escape regex specials but NOT glob wildcards * ? — then translate those.
+  const toRe = (seg) =>
+    seg
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*\*/g, "\x01")
+      .replace(/\*/g, "[^/]*")
+      .replace(/\x01/g, ".*")
+      .replace(/\?/g, "[^/]");
+  const pats = [];
+  for (let line of txt.split("\n")) {
+    line = line.trim();
+    if (!line || line.startsWith("#") || line.startsWith("!")) continue;
+    const anchored = line.startsWith("/");
+    const name = line.replace(/^\//, "").replace(/\/$/, "");
+    if (!name) continue;
+    const body = name.split("/").map(toRe).join("/");
+    pats.push({ anchored, hasSlash: name.includes("/"), re: new RegExp("^" + body + "(?:$|/)"), bare: new RegExp("(?:^|/)" + body + "(?:$|/)") });
+  }
+  return (ref) => {
+    const r = ref.replace(/^\.\//, "");
+    return pats.some((p) => (p.anchored || p.hasSlash ? p.re.test(r) : p.bare.test(r)));
+  };
+}
+
+// Package-manager subcommands that are NOT user scripts (so "pnpm outdated" etc.
+// must not be reported as a missing script).
+const NPM_BUILTINS = new Set([
+  "install", "i", "ci", "add", "remove", "rm", "uninstall", "update", "up", "upgrade",
+  "outdated", "audit", "exec", "dlx", "why", "list", "ls", "link", "unlink", "prune",
+  "dedupe", "store", "publish", "pack", "init", "create", "import", "rebuild", "run",
+  "run-script", "fund", "view", "info", "config", "cache", "patch", "approve-builds",
+  "dedupe", "licenses", "doctor", "ping", "owner", "deprecate", "dist-tag", "set", "get",
+]);
 
 // ---------------------------------------------------------------------------
 // Reference extraction (index-aware so we can inspect surrounding context)
@@ -214,8 +267,16 @@ function buildContext(root) {
 const PATHLIKE = /(?:\.\.?\/|[\w.-]+\/)[\w./-]+/;
 const GLOB_CHARS = /[*?{}\[\]]/;
 const PLACEHOLDER = /[<>]|\{\{|\}\}|:[a-z]/i;
+// "path/to/...", "your-thing/...", "<...>" style instructional placeholders.
+const PLACEHOLDER_PATH = /(?:^|\/)(?:path\/to|your[-_/]|some[-_/])/i;
+// An ALL_CAPS_UNDERSCORE leading segment is almost always a variable/placeholder
+// (ROOT_REPO/, CURRENT_BRANCH/, YOUR_PROJECT/) rather than a real directory.
+const PLACEHOLDER_VAR_SEG = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+(?:\/|$)/;
 const NEGATIVE =
   /\b(no longer|does\s*n[o']?t\s+exist|doesn'?t exist|don'?t use|do not use|has been (removed|renamed|moved|replaced|deleted)|was (removed|renamed|moved|replaced|deleted)|(now )?(moved|renamed|relocated|replaced) (to|by|with)|instead of|deprecated|removed in|formerly|used to (be|live)|previously|example only|placeholder|e\.g\.,? |there (is|are|'?s) no|no\s+\w+\s+(directory|folder|file)|must be initialized|not committed|git-?ignored)\b/i;
+// The artifact is describing a file it CREATES (an output), not one it references.
+const CREATION =
+  /\b(creat(e|es|ed|ing)|generat(e|es|ed|ing)|writ(e|es|ten|ing)\b|output(s|ted)?|produc(e|es|ed)|scaffold(s|ed)?|stub(s|bed)?|new file|save(d|s)? (to|as)|stored? (in|at))\b/i;
 
 const CODE_EXT = new Set([
   ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rb", ".go", ".rs",
@@ -223,11 +284,9 @@ const CODE_EXT = new Set([
   ".json", ".yaml", ".yml", ".toml", ".md", ".sql", ".html", ".css", ".scss",
   ".vue", ".svelte", ".astro", ".blade.php",
 ]);
-// Fallback only — the primary "is this a project path?" test is whether the
-// ref's first segment is a real top-level directory of the project (see ctx.topDirs).
 const SRC_PREFIX = /^(src|lib|app|test|tests|scripts|packages|cmd|internal|config|resources|routes|database|bootstrap)\//;
 // Common placeholder / example class & file names — not real references.
-const EXAMPLE_NAME = /(?:^|\/)(?:Foo|Bar|Baz|Qux|Example|Sample|Dummy|Placeholder|Acme|MyClass|YourClass|SomeClass)[A-Za-z0-9]*(?:\.|\/|$)/;
+const EXAMPLE_NAME = /(?:^|\/)(?:Foo|Bar|Baz|Qux|Example|Sample|Dummy|Placeholder|Acme|MyClass|YourClass|SomeClass|File\d+|example[-_.]|sample[-_.]|your[-_]|some[-_]|test_file)[A-Za-z0-9]*(?:\.|\/|$)/i;
 // Runtime-generated / ephemeral paths that are legitimately absent on a fresh clone.
 const EPHEMERAL = /^(?:bootstrap\/cache|storage\/(?:framework|logs|app)|public\/(?:hot|build|storage)|coverage)\//;
 
@@ -243,6 +302,19 @@ function contextWindow(text, idx) {
   const prevStart = text.lastIndexOf("\n", lineStart - 2) + 1;
   return text.slice(prevStart, lineEnd);
 }
+
+// Byte ranges covered by inline code spans / fenced code blocks. Commands are
+// only trusted inside these — "just the right way" in prose is not a `just` call.
+function codeRanges(text) {
+  const ranges = [];
+  let m;
+  const fence = /```[\s\S]*?```|~~~[\s\S]*?~~~/g;
+  while ((m = fence.exec(text))) ranges.push([m.index, m.index + m[0].length]);
+  const inline = /`[^`\n]+`/g;
+  while ((m = inline.exec(text))) ranges.push([m.index, m.index + m[0].length]);
+  return ranges;
+}
+const inRanges = (ranges, i) => ranges.some(([s, e]) => i >= s && i < e);
 
 // Yield path candidates with index + neighbouring chars.
 function* pathCandidates(text) {
@@ -264,24 +336,30 @@ function* pathCandidates(text) {
   }
 }
 
-function classifyPath(cand, text, root, artifactPath, reality) {
+function classifyPath(cand, text, root, artifactPath, ctx) {
   const { raw, idx, before, after } = cand;
   const refRaw = raw;
   const ref = norm(raw.replace(GLOB_CHARS, ""));
-  const topDirs = reality?.topDirs || new Set();
-  const submodulePaths = reality?.submodulePaths || [];
+  const topDirs = ctx?.topDirs || new Set();
+  const submodulePaths = ctx?.submodulePaths || [];
 
   // glob / pattern — never a single concrete file
   if (GLOB_CHARS.test(refRaw) || GLOB_CHARS.test(after)) return { suppress: { ref: refRaw, why: "glob/pattern" } };
   // placeholder tokens
   if (PLACEHOLDER.test(refRaw)) return { suppress: { ref: refRaw, why: "placeholder" } };
   if (!looksLikePath(ref)) return null;
+  // shell / env variable reference, e.g. "$ROOT_REPO/..." (the `$` was dropped by the lookbehind)
+  if (before.endsWith("$")) return { suppress: { ref, why: "shell/env variable" } };
   // external / home paths (the `~/` was stripped by the lookbehind — detect via `before`)
   if (before.includes("~") || raw.startsWith("~")) return { suppress: { ref, why: "external home path (~)" } };
   // PHP/namespace separator immediately before
   if (before.endsWith("\\")) return { suppress: { ref, why: "namespace (backslash)" } };
   // token is the tail of a longer path/filename, e.g. "Herd.app/Contents/..."
   if (/[A-Za-z0-9]\.$/.test(before)) return { suppress: { ref, why: "partial of a longer path" } };
+  // leading ALL_CAPS_UNDERSCORE segment → a variable/placeholder (ROOT_REPO/, CURRENT_BRANCH/)
+  if (PLACEHOLDER_VAR_SEG.test(ref)) return { suppress: { ref, why: "placeholder/variable segment" } };
+  // instructional placeholder paths (path/to/..., your-thing/...)
+  if (PLACEHOLDER_PATH.test(ref)) return { suppress: { ref, why: "instructional placeholder path" } };
   // example/placeholder class or file names
   if (EXAMPLE_NAME.test(ref)) return { suppress: { ref, why: "example/placeholder name" } };
   // git submodule contents — legitimately absent until `git submodule update`
@@ -290,11 +368,13 @@ function classifyPath(cand, text, root, artifactPath, reality) {
   // editor / IDE config — usually local-only / git-ignored
   if (/^\.(vscode|idea|fleet|zed|vs)\//.test(refClean)) return { suppress: { ref, why: "editor/IDE config (often local-only)" } };
 
-  const abs1 = path.resolve(root, ref);
-  const abs2 = path.resolve(path.dirname(artifactPath), ref);
-  const foundAbs = exists(abs1) ? abs1 : exists(abs2) ? abs2 : null;
+  // Resolve against project root, the artifact's dir, and (for leading-slash refs
+  // written as repo-relative) the root with the slash stripped.
+  const candidates = [path.resolve(root, ref), path.resolve(path.dirname(artifactPath), ref)];
+  if (ref.startsWith("/")) candidates.push(path.resolve(root, ref.replace(/^\/+/, "")));
+  const foundAbs = candidates.find((c) => exists(c)) || null;
   if (foundAbs) {
-    if (caseSensitiveExists(foundAbs)) return null; // genuinely fine
+    if (caseSensitiveExists(foundAbs)) return { ok: true }; // genuinely fine (counts as a resolving ref)
     return {
       emit: {
         ref, kind: "path", severity: "broken", confidence: "medium",
@@ -305,16 +385,23 @@ function classifyPath(cand, text, root, artifactPath, reality) {
 
   const ext = path.extname(ref).toLowerCase();
   // Language-agnostic: a ref "looks like a project file" if it has a known code
-  // extension OR its first segment is a real top-level directory of THIS project.
+  // extension OR its first segment is a real top-level directory of THIS project
+  // (Go internal/, C# modules/, Rust crates/, …) — not just the PHP/JS allowlist.
   const firstSeg = refClean.split("/")[0];
   const looksReal = CODE_EXT.has(ext) || topDirs.has(firstSeg) || SRC_PREFIX.test(ref);
   if (!looksReal) return { suppress: { ref, why: "not clearly a project file" } };
 
+  // gitignored → intentionally absent (secrets, local settings, build output, caches)
+  if (ctx.isIgnored && ctx.isIgnored(ref.replace(/^\/+/, ""))) return { suppress: { ref, why: "gitignored (intentionally absent)" } };
+
   // runtime-generated / ephemeral — legitimately absent on a fresh clone
   if (EPHEMERAL.test(ref)) return { suppress: { ref, why: "runtime-generated/ephemeral path" } };
 
+  const ctxLine = contextWindow(text, idx);
   // negative context — the doc is *describing* the absence, not asserting presence
-  if (NEGATIVE.test(contextWindow(text, idx))) return { suppress: { ref, why: "documented as removed/moved (negative context)" } };
+  if (NEGATIVE.test(ctxLine)) return { suppress: { ref, why: "documented as removed/moved (negative context)" } };
+  // creation context — the doc describes a file it CREATES (an output), not a reference
+  if (CREATION.test(ctxLine)) return { suppress: { ref, why: "described as created (output path)" } };
 
   // namespace-like: no extension, PascalCase tail, sibling .php files exist
   if (!ext && namespaceLike(ref, root)) return { suppress: { ref, why: "namespace-like (matching class exists)" } };
@@ -344,7 +431,7 @@ const COMPOSER_BUILTINS = new Set([
   "reinstall", "search", "status", "suggests", "depends", "bump", "browse", "home",
 ]);
 const CMD_PATTERNS = [
-  { re: /\b(?:npm run|pnpm run|pnpm|yarn(?: run)?|bun run)\s+([A-Za-z0-9:_-]+)/g, kind: "npm-script", ctx: "npmScripts" },
+  { re: /\b(?:npm run|pnpm run|pnpm|yarn(?: run)?|bun run)\s+([A-Za-z0-9:_-]+)/g, kind: "npm-script", ctx: "npmScripts", skip: (n) => NPM_BUILTINS.has(n) },
   { re: /\bcomposer(?:\s+run(?:-script)?)?\s+([A-Za-z0-9:_-]+)/g, kind: "composer-script", ctx: "composerScripts", skip: (n) => COMPOSER_BUILTINS.has(n) },
   { re: /\bmake\s+([A-Za-z0-9:_-]+)/g, kind: "make-target", ctx: "makeTargets" },
   { re: /\benvoy\s+run\s+([A-Za-z0-9:_-]+)/g, kind: "envoy-task", ctx: "envoyTasks" },
@@ -353,17 +440,21 @@ const CMD_PATTERNS = [
 
 function checkCommands(text, ctx) {
   const broken = [];
+  const ranges = codeRanges(text);
   for (const { re, kind, ctx: ctxKey, skip } of CMD_PATTERNS) {
     const known = ctx[ctxKey];
     if (!known) continue; // manifest absent → cannot verify
     for (const m of text.matchAll(re)) {
+      if (!inRanges(ranges, m.index)) continue; // ignore prose ("just the right way")
       const after = text[m.index + m[0].length] || "";
       if (after === "{" || after === "*" || after === ",") continue; // brace/glob expansion, not a literal name
       const name = m[1].replace(/[-:]+$/, ""); // strip trailing punctuation contamination
       if (!name || (skip && skip(name))) continue;
-      if (!known.includes(name)) {
-        broken.push({ ref: name, kind, severity: "broken", confidence: "high", reason: `not defined (${ctxKey})` });
-      }
+      if (known.includes(name)) continue;
+      // just recipes we can't resolve (modules/imports, or a `:` submodule name) → medium
+      const confidence =
+        ctxKey === "justRecipes" && (ctx.justHasModules || name.includes(":")) ? "medium" : "high";
+      broken.push({ ref: name, kind, severity: "broken", confidence, reason: `not defined (${ctxKey})` });
     }
   }
   return broken;
@@ -477,16 +568,32 @@ function verifyArtifact(artifact, root, ctx, names, baseline) {
   const fm = extractFrontmatter(text);
   const brokenRefs = [];
   const suppressed = [];
+  let resolvedReal = 0;
 
   for (const cand of pathCandidates(text)) {
     const res = classifyPath(cand, text, root, artifact.path, ctx);
     if (!res) continue;
-    if (res.suppress) suppressed.push(res.suppress);
+    if (res.ok) resolvedReal++;
+    else if (res.suppress) suppressed.push(res.suppress);
     else if (res.emit) brokenRefs.push(res.emit);
   }
   // de-dup brokenRefs by ref+kind
   const seen = new Set();
   const dedupBroken = brokenRefs.filter((b) => { const k = b.kind + "|" + b.ref; return seen.has(k) ? false : (seen.add(k), true); });
+
+  // Corroboration rule: a broken path is only HIGH confidence if the artifact is
+  // demonstrably grounded in THIS repo — i.e. at least one other path it names
+  // actually resolves. If NONE of its real-looking paths resolve, the artifact is
+  // either a generic/example template (toolkit skills, instructional agents) or is
+  // wholesale stale; either way "high-confidence broken" is wrong. Downgrade its
+  // path findings to low and let the semantic pass adjudicate.
+  if (resolvedReal === 0) {
+    for (const b of dedupBroken) {
+      if (b.kind !== "path") continue;
+      b.confidence = "low";
+      b.reason += " — artifact references no paths that resolve in this repo (generic/example or fully stale; needs semantic review)";
+    }
+  }
 
   dedupBroken.push(...checkCommands(text, ctx));
   dedupBroken.push(...checkConfigCommands(artifact, root));
