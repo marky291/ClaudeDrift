@@ -110,6 +110,25 @@ Every finding carries a `confidence` and a `source` (`script`, `auditor`, or
 `both`). Candidates the script deliberately ignores are listed under `suppressed`
 with a reason, so its decisions are auditable.
 
+### How precision is kept high (language-agnostic)
+
+The deterministic pass is tuned to avoid false positives across ecosystems
+(validated on PHP, Elixir, Python, C#, JS, and Rust/Lua repos):
+
+- **Suppressed, not flagged:** globs, `<placeholder>` / `path/to` / `$SHELL_VAR`
+  / `ALL_CAPS` template tokens, `~/` and absolute machine paths, example names
+  (`FooService`, `File1`), runtime-generated files, and anything matched by the
+  repo's `.gitignore` (secrets, local settings, build output).
+- **Context-aware:** a path a doc says it *creates* (“writes `x`”) or that it
+  documents as *removed* (“`x` no longer exists”) is not reported.
+- **Commands only in code spans:** `just build` in a fenced block is checked;
+  “just the right way” in prose is not. Package-manager builtins (`pnpm outdated`)
+  and unresolved module recipes (`deps:outdated`) are excluded or downgraded.
+- **Corroboration rule:** a broken path is only **high** confidence if the same
+  artifact also names a path that *does* resolve (proof it really describes this
+  repo). An artifact where nothing resolves — a generic toolkit skill or a fully
+  stale doc — is downgraded to **low** and left for the semantic pass to judge.
+
 ## Not in scope (yet)
 
 - Passive/blocking hooks (e.g. SessionStart nudges, PreToolUse warnings) — v1 is

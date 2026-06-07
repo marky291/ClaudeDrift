@@ -1,7 +1,7 @@
 {
   "name": "claude-drift",
   "displayName": "ClaudeDrift",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Detects and fixes drift between a project's Claude artifacts (CLAUDE.md, skills, commands, agents, hooks/settings) and the project's actual current reality.",
   "author": {
     "name": "Mark Hester",

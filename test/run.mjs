@@ -40,6 +40,17 @@ write("Envoy.blade.php", "@task('deploy') echo hi @endtask\n");
 // two real skills sharing the 'proj-' prefix (so cross-ref prefix is detected)
 write("skills/proj-foo/SKILL.md", "---\ndescription: foo\n---\nfoo skill\n");
 write("skills/proj-bar/SKILL.md", "---\ndescription: bar\n---\nbar skill\n");
+// a generic/template artifact: references several real-looking paths, NONE resolve
+write(
+  "skills/proj-template/SKILL.md",
+  [
+    "---", "description: generic scaffolder", "---",
+    "The auth flow lives in `src/api/login.ts` and `src/api/refresh.ts`.",
+    "Tokens come from `src/db/pool.ts`, middleware from `src/middleware/auth.ts`,",
+    "types from `src/types/user.ts`, and config from `src/config/app.ts`.",
+  ].join("\n")
+);
+
 // the project uses .claude/ layout for the rest
 fs.cpSync(path.join(FX, "skills"), path.join(FX, ".claude", "skills"), { recursive: true });
 fs.rmSync(path.join(FX, "skills"), { recursive: true });
@@ -51,7 +62,8 @@ write(
     "# Fixture",
     "",
     "## True positives (should be FOUND)",
-    "- Entry point is `src/main.ts`.", // missing path -> broken
+    "- The real entry is `app/Models/User.php`.", // resolves -> grounds the artifact (corroboration)
+    "- Entry point is `src/main.ts`.", // missing path -> broken (HIGH, because corroborated)
     "- Run `npm run test` to test.", // missing npm script -> broken
     "- Run `composer run lint`.", // missing composer script -> broken
     "- Deploy with `envoy run ghost`.", // missing envoy task -> broken
@@ -93,6 +105,8 @@ const findingHas = (sub) => [...findingRefs].some((r) => r.includes(sub));
 const suppressedHas = (why) => suppressedReasons.some((w) => w.includes(why));
 // a ref was NOT emitted as a finding (i.e. correctly not flagged)
 const notFlagged = (sub) => ![...findingRefs].some((r) => r.includes(sub));
+const findingFor = (sub) => j.findings.find((f) => (f.ref || "").includes(sub));
+const confidenceOf = (sub) => (findingFor(sub) || {}).confidence;
 
 // ---------------------------------------------------------------------------
 // Assertions
@@ -120,6 +134,12 @@ const tests = [
   ["does NOT flag external secret.json", () => notFlagged("secret.json")],
   ["does NOT flag negative src/old.ts", () => notFlagged("src/old.ts")],
   ["does NOT flag resolving cross-ref proj-foo", () => !findingRefs.has("proj-foo")],
+  // corroboration: grounded artifact keeps HIGH; ungrounded template drops to LOW
+  ["corroborated broken ref is HIGH confidence", () => confidenceOf("src/main.ts") === "high"],
+  ["template artifact (no resolving paths) is LOW", () => {
+    const tf = j.findings.filter((f) => f.artifact.includes("proj-template") && f.kind === "path");
+    return tf.length >= 3 && tf.every((f) => f.confidence === "low");
+  }],
 ];
 
 let failed = 0;
