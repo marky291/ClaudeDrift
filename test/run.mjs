@@ -1,0 +1,139 @@
+#!/usr/bin/env node
+// ClaudeDrift test suite. Builds a fixture project exercising every precision
+// rule (each case derived from a real false positive or true positive observed
+// in the wild) and asserts discover.mjs classifies it correctly.
+//
+//   node test/run.mjs
+//
+// Exits non-zero on any failed assertion. No dependencies — Node built-ins only.
+
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const SCRIPT = path.join(HERE, "..", "scripts", "discover.mjs");
+
+// ---------------------------------------------------------------------------
+// Build fixture
+// ---------------------------------------------------------------------------
+const FX = path.join(os.tmpdir(), `claudedrift-test-${process.pid}`);
+function write(rel, content) {
+  const p = path.join(FX, rel);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, content);
+}
+fs.rmSync(FX, { recursive: true, force: true });
+fs.mkdirSync(FX, { recursive: true });
+
+// real files that DO exist
+write("src/Real.ts", "export const x = 1;\n");
+write("app/Models/User.php", "<?php class User {}\n");
+write("app/Services/PaymentService.php", "<?php class PaymentService {}\n");
+write("bootstrap/cache/.gitkeep", "");
+write("package.json", JSON.stringify({ scripts: { build: "tsc" } }));
+write("composer.json", JSON.stringify({ scripts: { test: "phpunit" } }));
+write("Envoy.blade.php", "@task('deploy') echo hi @endtask\n");
+
+// two real skills sharing the 'proj-' prefix (so cross-ref prefix is detected)
+write("skills/proj-foo/SKILL.md", "---\ndescription: foo\n---\nfoo skill\n");
+write("skills/proj-bar/SKILL.md", "---\ndescription: bar\n---\nbar skill\n");
+// the project uses .claude/ layout for the rest
+fs.cpSync(path.join(FX, "skills"), path.join(FX, ".claude", "skills"), { recursive: true });
+fs.rmSync(path.join(FX, "skills"), { recursive: true });
+
+// CLAUDE.md packed with every case
+write(
+  "CLAUDE.md",
+  [
+    "# Fixture",
+    "",
+    "## True positives (should be FOUND)",
+    "- Entry point is `src/main.ts`.", // missing path -> broken
+    "- Run `npm run test` to test.", // missing npm script -> broken
+    "- Run `composer run lint`.", // missing composer script -> broken
+    "- Deploy with `envoy run ghost`.", // missing envoy task -> broken
+    "- See `src/real.ts` for details.", // case mismatch (real file is src/Real.ts)
+    "- Use the proj-missing skill to do X.", // cross-ref to non-existent skill
+    "",
+    "## False positives (should be SUPPRESSED)",
+    "- All models live in `app/Models/User*`.", // glob
+    "- Templates: `gitbook/scripts/<name>.md`.", // placeholder
+    "- Secrets in `~/.config/app/secret.json`.", // external home path
+    "- Built by `/opt/tools/Build.app/Contents/runner`.", // partial of longer abs path
+    "- Example: `app/Services/FooService.php`.", // example/placeholder name
+    "- Cache at `bootstrap/cache/config.php`.", // ephemeral/runtime-generated
+    "- The file `src/old.ts` no longer exists.", // negative context
+    "- The PaymentService class via `app/Services/PaymentService`.", // namespace-like (PHP class exists)
+    "- Use the proj-foo skill (this one exists).", // cross-ref that resolves -> no finding
+    "",
+    "## Env",
+    "- Needs `STRIPE_SECRET_KEY`.", // not in .env.example (none) -> no env check (envKeys null)
+  ].join("\n")
+);
+
+// ---------------------------------------------------------------------------
+// Run
+// ---------------------------------------------------------------------------
+let out;
+try {
+  out = execFileSync("node", [SCRIPT, FX], { encoding: "utf8" });
+} catch (e) {
+  console.error("discover.mjs crashed:", e.message);
+  process.exit(1);
+}
+const j = JSON.parse(out);
+
+const findingRefs = new Set(j.findings.map((f) => f.ref));
+const suppressed = j.artifacts.flatMap((a) => a.suppressed || []);
+const suppressedReasons = suppressed.map((s) => s.why);
+const findingHas = (sub) => [...findingRefs].some((r) => r.includes(sub));
+const suppressedHas = (why) => suppressedReasons.some((w) => w.includes(why));
+// a ref was NOT emitted as a finding (i.e. correctly not flagged)
+const notFlagged = (sub) => ![...findingRefs].some((r) => r.includes(sub));
+
+// ---------------------------------------------------------------------------
+// Assertions
+// ---------------------------------------------------------------------------
+const tests = [
+  // true positives
+  ["finds missing path src/main.ts", () => findingHas("src/main.ts")],
+  ["finds missing npm script 'test'", () => findingRefs.has("test")],
+  ["finds missing composer script 'lint'", () => findingRefs.has("lint")],
+  ["finds missing envoy task 'ghost'", () => findingRefs.has("ghost")],
+  ["finds case-mismatch src/real.ts", () => findingHas("src/real.ts")],
+  ["finds cross-ref proj-missing", () => findingRefs.has("proj-missing")],
+  // false positives correctly suppressed
+  ["suppresses glob app/Models/User*", () => suppressedHas("glob")],
+  ["suppresses placeholder <name>.md", () => suppressedHas("placeholder")],
+  ["suppresses external ~/.config path", () => suppressedHas("external")],
+  ["suppresses partial-of-longer-path", () => suppressedHas("partial")],
+  ["suppresses example FooService", () => suppressedHas("example")],
+  ["suppresses ephemeral bootstrap/cache", () => suppressedHas("ephemeral")],
+  ["suppresses negative-context src/old.ts", () => suppressedHas("negative")],
+  // things that must NOT be flagged
+  ["does NOT flag glob User*", () => notFlagged("app/Models/User*")],
+  ["does NOT flag FooService", () => notFlagged("FooService")],
+  ["does NOT flag bootstrap/cache", () => notFlagged("bootstrap/cache")],
+  ["does NOT flag external secret.json", () => notFlagged("secret.json")],
+  ["does NOT flag negative src/old.ts", () => notFlagged("src/old.ts")],
+  ["does NOT flag resolving cross-ref proj-foo", () => !findingRefs.has("proj-foo")],
+];
+
+let failed = 0;
+for (const [name, fn] of tests) {
+  let ok = false;
+  try { ok = !!fn(); } catch { ok = false; }
+  console.log(`${ok ? "✅" : "❌"} ${name}`);
+  if (!ok) failed++;
+}
+
+console.log(`\n${tests.length - failed}/${tests.length} passed`);
+if (failed) {
+  console.log("\nFindings:", [...findingRefs].join(", "));
+  console.log("Suppressed reasons:", [...new Set(suppressedReasons)].join(", "));
+}
+fs.rmSync(FX, { recursive: true, force: true });
+process.exit(failed ? 1 : 0);

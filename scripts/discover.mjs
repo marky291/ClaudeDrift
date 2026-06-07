@@ -1,92 +1,108 @@
 #!/usr/bin/env node
 // ClaudeDrift — deterministic discovery + hard-reference checker.
 //
-// Usage:  node discover.mjs [projectDir] [--user]
+// Usage:
+//   node discover.mjs [projectDir] [options]
+//
+// Options:
+//   --user              also scan ~/.claude artifacts (reported as scope:user)
+//   --report <path>     write a markdown report to <path>
+//   --merge <file>      merge auditor findings JSON (array) with the hard checks
+//                       and emit a single unified, de-duplicated report
+//   --baseline          write/update the baseline state file and exit
+//   --changed-only      only include artifacts changed since the baseline
+//   --ci                CI mode: exit non-zero when findings meet --fail-on
+//   --fail-on <sev>     broken | warning | any   (default: broken)
 //
 // Discovers every Claude artifact that influences a project (CLAUDE.md files,
-// skills, commands, agents, settings/hooks) and verifies the concrete references
-// inside them against the live filesystem / package manifests. Emits a single
-// JSON object on stdout. No npm dependencies — Node built-ins only, because
+// skills, commands, agents, settings/hooks, .mcp.json) and verifies the concrete
+// references inside them against the live filesystem / package manifests. Emits a
+// single JSON object on stdout. No npm dependencies — Node built-ins only, because
 // Claude Code itself runs on Node so `node` is always available.
 
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // Args
 // ---------------------------------------------------------------------------
 const argv = process.argv.slice(2);
-const includeUser = argv.includes("--user");
-const positional = argv.filter((a) => !a.startsWith("--"));
+function flag(name) {
+  return argv.includes(name);
+}
+function opt(name, def = null) {
+  const i = argv.indexOf(name);
+  return i >= 0 && argv[i + 1] ? argv[i + 1] : def;
+}
+const includeUser = flag("--user");
+const reportPath = opt("--report");
+const mergeFile = opt("--merge");
+const writeBaseline = flag("--baseline");
+const changedOnly = flag("--changed-only");
+const ciMode = flag("--ci");
+const failOn = opt("--fail-on", "broken");
+
+const positional = argv.filter(
+  (a, i) =>
+    !a.startsWith("--") &&
+    !["--report", "--merge", "--fail-on"].includes(argv[i - 1])
+);
 const PROJECT_DIR = path.resolve(
   positional[0] || process.env.CLAUDE_PROJECT_DIR || process.cwd()
 );
 const HOME = os.homedir();
 const USER_CLAUDE = path.join(HOME, ".claude");
+const BASELINE_PATH = path.join(PROJECT_DIR, ".claude", ".drift-baseline.json");
 
 const IGNORE_DIRS = new Set([
-  ".git",
-  "node_modules",
-  ".next",
-  "dist",
-  "build",
-  "out",
-  ".venv",
-  "venv",
-  "__pycache__",
-  ".cache",
-  "vendor",
-  "target",
-  ".idea",
-  ".vscode",
+  ".git", "node_modules", ".next", "dist", "build", "out", ".venv", "venv",
+  "__pycache__", ".cache", "vendor", "target", ".idea", ".vscode",
 ]);
 
 // ---------------------------------------------------------------------------
 // Small fs helpers
 // ---------------------------------------------------------------------------
-function exists(p) {
-  try {
-    fs.accessSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-function readText(p) {
-  try {
-    return fs.readFileSync(p, "utf8");
-  } catch {
-    return null;
-  }
-}
-function readJSON(p) {
+const exists = (p) => {
+  try { fs.accessSync(p); return true; } catch { return false; }
+};
+const readText = (p) => {
+  try { return fs.readFileSync(p, "utf8"); } catch { return null; }
+};
+const readJSON = (p) => {
   const t = readText(p);
   if (t == null) return null;
-  try {
-    return JSON.parse(t);
-  } catch {
-    return null;
+  try { return JSON.parse(t); } catch { return null; }
+};
+const mtime = (p) => {
+  try { return fs.statSync(p).mtimeMs; } catch { return null; }
+};
+const sha = (s) => crypto.createHash("sha256").update(s).digest("hex").slice(0, 16);
+const rel = (p) => p.replace(PROJECT_DIR + path.sep, "");
+
+// Case-sensitive existence test (macOS/Windows are case-insensitive by default,
+// so a ref that "exists" here may still break on Linux/production). Walks the
+// path segment by segment checking exact case via readdir.
+function caseSensitiveExists(abs) {
+  const parts = abs.split(path.sep);
+  let cur = parts[0] === "" ? path.sep : parts[0];
+  for (let i = 1; i < parts.length; i++) {
+    const seg = parts[i];
+    if (!seg) continue;
+    let entries;
+    try { entries = fs.readdirSync(cur || path.sep); } catch { return false; }
+    if (!entries.includes(seg)) return false;
+    cur = path.join(cur, seg);
   }
-}
-function mtime(p) {
-  try {
-    return fs.statSync(p).mtimeMs;
-  } catch {
-    return null;
-  }
+  return true;
 }
 
-// Recursively walk, returning files matching `test`, skipping IGNORE_DIRS.
 function walk(dir, test, maxDepth = 8, depth = 0, acc = []) {
   if (depth > maxDepth || !exists(dir)) return acc;
   let entries;
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return acc;
-  }
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return acc; }
   for (const ent of entries) {
     const full = path.join(dir, ent.name);
     if (ent.isDirectory()) {
@@ -104,123 +120,311 @@ function walk(dir, test, maxDepth = 8, depth = 0, acc = []) {
 // ---------------------------------------------------------------------------
 function discoverArtifacts(root, scope) {
   const found = [];
-  const add = (p, type) => {
-    if (exists(p)) found.push({ path: p, type, scope });
-  };
+  const add = (p, type) => { if (exists(p)) found.push({ path: p, type, scope }); };
 
   if (scope === "project") {
-    // All CLAUDE.md anywhere in the tree (nested memory files).
-    for (const f of walk(root, (_full, name) => name === "CLAUDE.md")) {
+    for (const f of walk(root, (_f, name) => name === "CLAUDE.md")) {
       found.push({ path: f, type: "claude-md", scope });
     }
+    add(path.join(root, ".mcp.json"), "mcp");
   } else {
     add(path.join(root, "CLAUDE.md"), "claude-md");
   }
 
-  const dotClaude = path.join(root, ".claude");
-  const base = scope === "user" ? root : dotClaude; // user artifacts live under ~/.claude directly
-
-  // settings / hooks
+  const base = scope === "user" ? root : path.join(root, ".claude");
   add(path.join(base, "settings.json"), "settings");
   add(path.join(base, "settings.local.json"), "settings");
   add(path.join(base, "hooks", "hooks.json"), "hooks");
+  add(path.join(base, ".mcp.json"), "mcp");
 
-  // skills: <base>/skills/<name>/SKILL.md
-  const skillsDir = path.join(base, "skills");
-  for (const f of walk(skillsDir, (_full, name) => name === "SKILL.md", 4)) {
+  for (const f of walk(path.join(base, "skills"), (_f, name) => name === "SKILL.md", 4))
     found.push({ path: f, type: "skill", scope });
-  }
-
-  // commands: <base>/commands/**/*.md
-  const cmdDir = path.join(base, "commands");
-  for (const f of walk(cmdDir, (_full, name) => name.endsWith(".md"), 4)) {
+  for (const f of walk(path.join(base, "commands"), (_f, name) => name.endsWith(".md"), 4))
     found.push({ path: f, type: "command", scope });
-  }
-
-  // agents: <base>/agents/*.md
-  const agentsDir = path.join(base, "agents");
-  for (const f of walk(agentsDir, (_full, name) => name.endsWith(".md"), 4)) {
+  for (const f of walk(path.join(base, "agents"), (_f, name) => name.endsWith(".md"), 4))
     found.push({ path: f, type: "agent", scope });
-  }
 
-  // de-dup by path
   const seen = new Set();
-  return found.filter((a) => {
-    if (seen.has(a.path)) return false;
-    seen.add(a.path);
-    return true;
-  });
+  return found.filter((a) => (seen.has(a.path) ? false : (seen.add(a.path), true)));
 }
 
 // ---------------------------------------------------------------------------
-// Reference extraction
+// Reality context (manifests / known commands / artifact names)
 // ---------------------------------------------------------------------------
+function buildContext(root) {
+  const pkg = readJSON(path.join(root, "package.json"));
+  const composer = readJSON(path.join(root, "composer.json"));
 
-// Path-like tokens: backticked paths, ./ ../ relative, or dir/seg/seg with an
-// extension or known source dir prefix. Conservative to limit false positives.
-const PATH_IN_BACKTICKS = /`([^`\n]+)`/g;
-const PATH_BARE =
-  /(?<![\w/])((?:\.\.?\/)?(?:[\w.-]+\/){1,}[\w.-]+(?:\.[A-Za-z0-9]+)?)/g;
-const NPM_SCRIPT =
-  /\b(?:npm run|pnpm run|pnpm|yarn(?: run)?|bun run)\s+([A-Za-z0-9:_-]+)/g;
-const MAKE_TARGET = /\bmake\s+([A-Za-z0-9:_-]+)/g;
+  const makeText = readText(path.join(root, "Makefile")) || readText(path.join(root, "makefile"));
+  const makeTargets = makeText
+    ? makeText.split("\n").map((l) => l.match(/^([A-Za-z0-9:_-]+):(?!=)/)).filter(Boolean).map((m) => m[1])
+    : null;
 
+  const justText = readText(path.join(root, "justfile")) || readText(path.join(root, "Justfile"));
+  const justRecipes = justText
+    ? justText.split("\n").map((l) => l.match(/^([a-zA-Z0-9_-]+)\s*:/)).filter(Boolean).map((m) => m[1])
+    : null;
+
+  // Laravel Envoy tasks/stories.
+  const envoyText = readText(path.join(root, "Envoy.blade.php"));
+  let envoyTasks = null;
+  if (envoyText != null) {
+    envoyTasks = [];
+    for (const m of envoyText.matchAll(/@(?:task|story)\(\s*['"]([^'"]+)['"]/g)) envoyTasks.push(m[1]);
+  }
+
+  // env keys from .env.example
+  const envText = readText(path.join(root, ".env.example"));
+  const envKeys = envText
+    ? new Set(envText.split("\n").map((l) => l.match(/^([A-Z][A-Z0-9_]+)=/)).filter(Boolean).map((m) => m[1]))
+    : null;
+
+  return {
+    npmScripts: pkg && pkg.scripts ? Object.keys(pkg.scripts) : null,
+    composerScripts: composer && composer.scripts ? Object.keys(composer.scripts) : null,
+    makeTargets,
+    justRecipes,
+    envoyTasks,
+    envKeys,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Reference extraction (index-aware so we can inspect surrounding context)
+// ---------------------------------------------------------------------------
 const PATHLIKE = /(?:\.\.?\/|[\w.-]+\/)[\w./-]+/;
-const LOOKS_LIKE_PATH = (s) =>
-  PATHLIKE.test(s) &&
-  !s.includes("://") &&
-  !s.startsWith("http") &&
-  !/\s/.test(s) &&
-  !s.startsWith("$") &&
-  !s.includes("${") &&
-  !s.includes("*") &&
-  s.length < 200;
+const GLOB_CHARS = /[*?{}\[\]]/;
+const PLACEHOLDER = /[<>]|\{\{|\}\}|:[a-z]/i;
+const NEGATIVE =
+  /\b(no longer|does\s*n[o']?t\s+exist|doesn'?t exist|don'?t use|do not use|has been (removed|renamed|moved|replaced|deleted)|was (removed|renamed|moved|replaced|deleted)|(now )?(moved|renamed|relocated|replaced) (to|by|with)|instead of|deprecated|removed in|formerly|used to (be|live)|previously|example only|placeholder|e\.g\.,? )\b/i;
 
 const CODE_EXT = new Set([
   ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rb", ".go", ".rs",
   ".java", ".kt", ".c", ".h", ".cpp", ".hpp", ".cs", ".php", ".swift", ".sh",
   ".json", ".yaml", ".yml", ".toml", ".md", ".sql", ".html", ".css", ".scss",
-  ".vue", ".svelte", ".astro",
+  ".vue", ".svelte", ".astro", ".blade.php",
 ]);
+const SRC_PREFIX = /^(src|lib|app|test|tests|scripts|packages|cmd|internal|config|resources|routes|database|bootstrap)\//;
+// Common placeholder / example class & file names — not real references.
+const EXAMPLE_NAME = /(?:^|\/)(?:Foo|Bar|Baz|Qux|Example|Sample|Dummy|Placeholder|Acme|MyClass|YourClass|SomeClass)[A-Za-z0-9]*(?:\.|\/|$)/;
+// Runtime-generated / ephemeral paths that are legitimately absent on a fresh clone.
+const EPHEMERAL = /^(?:bootstrap\/cache|storage\/(?:framework|logs|app)|public\/(?:hot|build|storage)|coverage)\//;
 
-function extractRefs(text) {
-  const paths = new Set();
-  const npmScripts = new Set();
-  const makeTargets = new Set();
+const norm = (s) => s.replace(/[),.;:]+$/, "").replace(/\/$/, "");
+const looksLikePath = (s) =>
+  PATHLIKE.test(s) && !s.includes("://") && !s.startsWith("http") &&
+  !/\s/.test(s) && !s.startsWith("$") && !s.includes("${") && s.length < 200;
 
-  // Normalize a path token: strip trailing punctuation and a single trailing
-  // slash so `src/handlers` and `src/handlers/` collapse to one ref.
-  const norm = (s) => s.replace(/[),.;:]+$/, "").replace(/\/$/, "");
-
-  let m;
-  // Backtick contents that look like paths.
-  PATH_IN_BACKTICKS.lastIndex = 0;
-  while ((m = PATH_IN_BACKTICKS.exec(text))) {
-    const inner = m[1].trim();
-    // a backticked command line — pull the first token if it's a path
-    const first = inner.split(/\s+/)[0];
-    if (LOOKS_LIKE_PATH(first)) paths.add(norm(first));
-    else if (LOOKS_LIKE_PATH(inner)) paths.add(norm(inner));
-  }
-  // Bare path tokens in prose.
-  PATH_BARE.lastIndex = 0;
-  while ((m = PATH_BARE.exec(text))) {
-    const tok = norm(m[1]);
-    if (LOOKS_LIKE_PATH(tok)) paths.add(tok);
-  }
-  NPM_SCRIPT.lastIndex = 0;
-  while ((m = NPM_SCRIPT.exec(text))) npmScripts.add(m[1]);
-  MAKE_TARGET.lastIndex = 0;
-  while ((m = MAKE_TARGET.exec(text))) makeTargets.add(m[1]);
-
-  return {
-    paths: [...paths],
-    npmScripts: [...npmScripts],
-    makeTargets: [...makeTargets],
-  };
+function contextWindow(text, idx) {
+  const lineStart = text.lastIndexOf("\n", idx) + 1;
+  let lineEnd = text.indexOf("\n", idx);
+  if (lineEnd < 0) lineEnd = text.length;
+  const prevStart = text.lastIndexOf("\n", lineStart - 2) + 1;
+  return text.slice(prevStart, lineEnd);
 }
 
-// Frontmatter (very small YAML subset) — pull tool/agent/hook hints.
+// Yield path candidates with index + neighbouring chars.
+function* pathCandidates(text) {
+  // backticked tokens
+  for (const m of text.matchAll(/`([^`\n]+)`/g)) {
+    const inner = m[1].trim();
+    const first = inner.split(/\s+/)[0];
+    const raw = looksLikePath(first) ? first : looksLikePath(inner) ? inner : null;
+    if (raw) yield { raw, idx: m.index + 1, before: text.slice(Math.max(0, m.index - 1), m.index + 1), after: "`" };
+  }
+  // bare tokens — capture trailing glob chars so we can detect (not truncate) globs
+  for (const m of text.matchAll(/(?<![\w/])((?:\.\.?\/)?(?:[\w.-]+\/){1,}[\w.@*?{}-]+(?:\.[A-Za-z0-9]+)?)/g)) {
+    yield {
+      raw: m[1],
+      idx: m.index,
+      before: text.slice(Math.max(0, m.index - 4), m.index),
+      after: text[m.index + m[0].length] || "",
+    };
+  }
+}
+
+function classifyPath(cand, text, root, artifactPath) {
+  const { raw, idx, before, after } = cand;
+  const refRaw = raw;
+  const ref = norm(raw.replace(GLOB_CHARS, ""));
+
+  // glob / pattern — never a single concrete file
+  if (GLOB_CHARS.test(refRaw) || GLOB_CHARS.test(after)) return { suppress: { ref: refRaw, why: "glob/pattern" } };
+  // placeholder tokens
+  if (PLACEHOLDER.test(refRaw)) return { suppress: { ref: refRaw, why: "placeholder" } };
+  if (!looksLikePath(ref)) return null;
+  // external / home paths (the `~/` was stripped by the lookbehind — detect via `before`)
+  if (before.includes("~") || raw.startsWith("~")) return { suppress: { ref, why: "external home path (~)" } };
+  // PHP/namespace separator immediately before
+  if (before.endsWith("\\")) return { suppress: { ref, why: "namespace (backslash)" } };
+  // token is the tail of a longer path/filename, e.g. "Herd.app/Contents/..."
+  if (/[A-Za-z0-9]\.$/.test(before)) return { suppress: { ref, why: "partial of a longer path" } };
+  // example/placeholder class or file names
+  if (EXAMPLE_NAME.test(ref)) return { suppress: { ref, why: "example/placeholder name" } };
+
+  const abs1 = path.resolve(root, ref);
+  const abs2 = path.resolve(path.dirname(artifactPath), ref);
+  const foundAbs = exists(abs1) ? abs1 : exists(abs2) ? abs2 : null;
+  if (foundAbs) {
+    if (caseSensitiveExists(foundAbs)) return null; // genuinely fine
+    return {
+      emit: {
+        ref, kind: "path", severity: "broken", confidence: "medium",
+        reason: "case mismatch — resolves on macOS/Windows but breaks on case-sensitive filesystems (Linux/CI)",
+      },
+    };
+  }
+
+  const ext = path.extname(ref).toLowerCase();
+  const looksReal = CODE_EXT.has(ext) || SRC_PREFIX.test(ref);
+  if (!looksReal) return { suppress: { ref, why: "not clearly a project file" } };
+
+  // runtime-generated / ephemeral — legitimately absent on a fresh clone
+  if (EPHEMERAL.test(ref)) return { suppress: { ref, why: "runtime-generated/ephemeral path" } };
+
+  // negative context — the doc is *describing* the absence, not asserting presence
+  if (NEGATIVE.test(contextWindow(text, idx))) return { suppress: { ref, why: "documented as removed/moved (negative context)" } };
+
+  // namespace-like: no extension, PascalCase tail, sibling .php files exist
+  if (!ext && namespaceLike(ref, root)) return { suppress: { ref, why: "namespace-like (matching class exists)" } };
+
+  return { emit: { ref, kind: "path", severity: "broken", confidence: "high", reason: "path not found on disk" } };
+}
+
+function namespaceLike(ref, root) {
+  const tail = ref.split("/").pop();
+  if (!/^[A-Z][A-Za-z0-9]+$/.test(tail)) return false;
+  let dir = path.dirname(path.resolve(root, ref));
+  while (dir.length >= root.length && !exists(dir)) dir = path.dirname(dir);
+  if (!exists(dir)) return false;
+  try {
+    return fs.readdirSync(dir).some((f) => f === `${tail}.php` || f.startsWith(tail));
+  } catch { return false; }
+}
+
+// ---------------------------------------------------------------------------
+// Command references
+// ---------------------------------------------------------------------------
+const COMPOSER_BUILTINS = new Set([
+  "install", "update", "require", "remove", "dump-autoload", "du", "run", "run-script",
+  "exec", "create-project", "global", "self-update", "selfupdate", "validate", "show",
+  "why", "why-not", "outdated", "audit", "archive", "check-platform-reqs", "clear-cache",
+  "clearcache", "cc", "config", "diagnose", "fund", "init", "licenses", "prohibits",
+  "reinstall", "search", "status", "suggests", "depends", "bump", "browse", "home",
+]);
+const CMD_PATTERNS = [
+  { re: /\b(?:npm run|pnpm run|pnpm|yarn(?: run)?|bun run)\s+([A-Za-z0-9:_-]+)/g, kind: "npm-script", ctx: "npmScripts" },
+  { re: /\bcomposer(?:\s+run(?:-script)?)?\s+([A-Za-z0-9:_-]+)/g, kind: "composer-script", ctx: "composerScripts", skip: (n) => COMPOSER_BUILTINS.has(n) },
+  { re: /\bmake\s+([A-Za-z0-9:_-]+)/g, kind: "make-target", ctx: "makeTargets" },
+  { re: /\benvoy\s+run\s+([A-Za-z0-9:_-]+)/g, kind: "envoy-task", ctx: "envoyTasks" },
+  { re: /\bjust\s+([A-Za-z0-9:_-]+)/g, kind: "just-recipe", ctx: "justRecipes" },
+];
+
+function checkCommands(text, ctx) {
+  const broken = [];
+  for (const { re, kind, ctx: ctxKey, skip } of CMD_PATTERNS) {
+    const known = ctx[ctxKey];
+    if (!known) continue; // manifest absent → cannot verify
+    for (const m of text.matchAll(re)) {
+      const after = text[m.index + m[0].length] || "";
+      if (after === "{" || after === "*" || after === ",") continue; // brace/glob expansion, not a literal name
+      const name = m[1].replace(/[-:]+$/, ""); // strip trailing punctuation contamination
+      if (!name || (skip && skip(name))) continue;
+      if (!known.includes(name)) {
+        broken.push({ ref: name, kind, severity: "broken", confidence: "high", reason: `not defined (${ctxKey})` });
+      }
+    }
+  }
+  return broken;
+}
+
+// ---------------------------------------------------------------------------
+// Hook command targets inside settings/hooks/mcp files
+// ---------------------------------------------------------------------------
+function collectCommands(json, key, acc = []) {
+  if (!json || typeof json !== "object") return acc;
+  if (Array.isArray(json)) { for (const x of json) collectCommands(x, key, acc); return acc; }
+  for (const [k, v] of Object.entries(json)) {
+    if (k === key && typeof v === "string") acc.push(v);
+    else if (typeof v === "object") collectCommands(v, key, acc);
+  }
+  return acc;
+}
+
+const KNOWN_RUNNERS = new Set(["npx", "node", "nodejs", "uvx", "uv", "python", "python3", "docker", "deno", "bun", "sh", "bash", "pnpm", "yarn", "go", "cargo", "php", "ruby", "java"]);
+
+function checkConfigCommands(artifact, root) {
+  const json = readJSON(artifact.path);
+  const broken = [];
+  if (!json) return broken;
+  if (artifact.type === "hooks" || artifact.type === "settings") {
+    for (const cmd of collectCommands(json, "command")) {
+      const cleaned = cmd.replace(/\$\{CLAUDE_PROJECT_DIR\}/g, root).replace(/\$CLAUDE_PROJECT_DIR/g, root).trim();
+      if (cleaned.includes("${")) continue;
+      const tok = cleaned.split(/\s+/)[0];
+      if (tok && (tok.includes("/") || tok.startsWith(".")) && !exists(path.resolve(root, tok)) && !exists(tok)) {
+        broken.push({ ref: tok, kind: "hook-command", severity: "broken", confidence: "high", reason: "hook command target not found" });
+      }
+    }
+  }
+  if (artifact.type === "mcp" && json.mcpServers) {
+    for (const [name, srv] of Object.entries(json.mcpServers)) {
+      const cmd = (srv.command || "").replace(/\$\{[^}]+\}/g, "").trim();
+      if (!cmd) continue;
+      if (cmd.includes("/") || cmd.startsWith(".")) {
+        if (!exists(path.resolve(root, cmd)) && !exists(cmd)) {
+          broken.push({ ref: `${name}: ${srv.command}`, kind: "mcp-command", severity: "broken", confidence: "medium", reason: "MCP server command path not found" });
+        }
+      } else if (!KNOWN_RUNNERS.has(cmd)) {
+        broken.push({ ref: `${name}: ${cmd}`, kind: "mcp-command", severity: "warning", confidence: "low", reason: "MCP server command may not be installed" });
+      }
+    }
+  }
+  return broken;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-references to other skills/agents + env var coverage
+// ---------------------------------------------------------------------------
+function checkCrossRefs(text, knownNames, prefix, selfName) {
+  if (!prefix) return [];
+  const broken = [];
+  const seen = new Set();
+  const re = new RegExp(`\\b(${prefix}[a-z0-9-]+)\\b`, "g");
+  for (const m of text.matchAll(re)) {
+    const name = m[1].replace(/-$/, "");
+    if (name === selfName || seen.has(name)) continue;
+    // Gate on context: only treat as a skill/agent reference when the surrounding
+    // text actually talks about skills/agents — the project prefix is often reused
+    // for service/process names (e.g. systemd units) that are not Claude artifacts.
+    if (!/\b(skill|agent|subagent|delegate|invoke)\b/i.test(contextWindow(text, m.index))) continue;
+    seen.add(name);
+    if (!knownNames.has(name)) {
+      broken.push({ ref: name, kind: "cross-ref", severity: "warning", confidence: "medium", reason: "references a skill/agent that does not exist" });
+    }
+  }
+  return broken;
+}
+
+const ENV_SUFFIX = /_(KEY|SECRET|TOKEN|ID|URL|DSN|HOST|PASSWORD|USER|PORT|REGION|BUCKET|ENDPOINT)$/;
+function checkEnvVars(text, envKeys) {
+  if (!envKeys) return [];
+  const broken = [];
+  const seen = new Set();
+  for (const m of text.matchAll(/`([A-Z][A-Z0-9_]{3,})`/g)) {
+    const v = m[1];
+    if (seen.has(v) || !ENV_SUFFIX.test(v)) continue;
+    seen.add(v);
+    if (!envKeys.has(v)) {
+      broken.push({ ref: v, kind: "env-var", severity: "warning", confidence: "low", reason: "env var not present in .env.example" });
+    }
+  }
+  return broken;
+}
+
+// ---------------------------------------------------------------------------
+// Frontmatter (small YAML subset)
+// ---------------------------------------------------------------------------
 function extractFrontmatter(text) {
   const fm = {};
   const match = text.match(/^---\n([\s\S]*?)\n---/);
@@ -233,125 +437,167 @@ function extractFrontmatter(text) {
 }
 
 // ---------------------------------------------------------------------------
-// Hard verification against the live tree
+// Per-artifact verification
 // ---------------------------------------------------------------------------
-function loadPackageScripts(root) {
-  const pkg = readJSON(path.join(root, "package.json"));
-  return pkg && pkg.scripts ? Object.keys(pkg.scripts) : null;
-}
-function loadMakeTargets(root) {
-  const mk = readText(path.join(root, "Makefile")) || readText(path.join(root, "makefile"));
-  if (mk == null) return null;
-  const targets = [];
-  for (const line of mk.split("\n")) {
-    const mm = line.match(/^([A-Za-z0-9:_-]+):(?!=)/);
-    if (mm) targets.push(mm[1]);
-  }
-  return targets;
-}
-
-function resolvePath(ref, root, artifactPath) {
-  // Try: relative to project root, relative to artifact's dir, and as-is.
-  const candidates = [
-    path.resolve(root, ref),
-    path.resolve(path.dirname(artifactPath), ref),
-  ];
-  return candidates.some((c) => exists(c));
-}
-
-function verifyArtifact(artifact, root, pkgScripts, makeTargets, gitLastMs) {
+function verifyArtifact(artifact, root, ctx, names, baseline) {
   const text = readText(artifact.path);
-  if (text == null) {
-    return { ...artifact, error: "unreadable", brokenRefs: [], refs: {} };
-  }
-  const refs = extractRefs(text);
+  if (text == null) return { path: artifact.path, type: artifact.type, scope: artifact.scope, error: "unreadable", brokenRefs: [], suppressed: [] };
+
   const fm = extractFrontmatter(text);
   const brokenRefs = [];
+  const suppressed = [];
 
-  for (const ref of refs.paths) {
-    // Skip refs that point outside / are clearly not project files.
-    if (resolvePath(ref, root, artifact.path)) continue;
-    // Only flag refs that look like real project artifacts (known ext or src-ish).
-    const ext = path.extname(ref).toLowerCase();
-    const looksReal = CODE_EXT.has(ext) || /^(src|lib|app|test|tests|scripts|packages|cmd|internal)\//.test(ref);
-    if (!looksReal) continue;
-    brokenRefs.push({ ref, kind: "path", reason: "path not found on disk" });
+  for (const cand of pathCandidates(text)) {
+    const res = classifyPath(cand, text, root, artifact.path);
+    if (!res) continue;
+    if (res.suppress) suppressed.push(res.suppress);
+    else if (res.emit) brokenRefs.push(res.emit);
   }
+  // de-dup brokenRefs by ref+kind
+  const seen = new Set();
+  const dedupBroken = brokenRefs.filter((b) => { const k = b.kind + "|" + b.ref; return seen.has(k) ? false : (seen.add(k), true); });
 
-  if (pkgScripts) {
-    for (const s of refs.npmScripts) {
-      if (!pkgScripts.includes(s)) {
-        brokenRefs.push({ ref: s, kind: "npm-script", reason: "not in package.json scripts" });
-      }
-    }
-  }
-  if (makeTargets) {
-    for (const t of refs.makeTargets) {
-      if (!makeTargets.includes(t)) {
-        brokenRefs.push({ ref: t, kind: "make-target", reason: "not in Makefile" });
-      }
-    }
-  }
+  dedupBroken.push(...checkCommands(text, ctx));
+  dedupBroken.push(...checkConfigCommands(artifact, root));
+  if (artifact.type !== "settings" && artifact.type !== "mcp")
+    dedupBroken.push(...checkCrossRefs(text, names.known, names.prefix, fm.name || path.basename(artifact.path, ".md")));
+  if (artifact.type === "claude-md") dedupBroken.push(...checkEnvVars(text, ctx.envKeys));
 
-  // hook command targets inside settings/hooks files
-  if (artifact.type === "hooks" || artifact.type === "settings") {
-    const json = readJSON(artifact.path);
-    for (const cmd of collectHookCommands(json)) {
-      const cleaned = cmd
-        .replace(/\$\{CLAUDE_PROJECT_DIR\}/g, root)
-        .replace(/\$CLAUDE_PROJECT_DIR/g, root)
-        .replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, "")
-        .trim();
-      const firstTok = cleaned.split(/\s+/)[0];
-      if (firstTok && (firstTok.includes("/") || firstTok.startsWith(".")) && !cleaned.includes("${")) {
-        if (!resolvePath(firstTok, root, artifact.path) && !exists(firstTok)) {
-          brokenRefs.push({ ref: firstTok, kind: "hook-command", reason: "hook command target not found" });
-        }
-      }
-    }
-  }
-
-  // recency hint: artifact older than most recent commit by a wide margin
+  // recency hint
   const aMtime = mtime(artifact.path);
-  const recencyStale =
-    gitLastMs && aMtime && gitLastMs - aMtime > 1000 * 60 * 60 * 24 * 30
-      ? Math.round((gitLastMs - aMtime) / (1000 * 60 * 60 * 24))
-      : null;
+  const recencyStaleDays =
+    ctx.gitLastMs && aMtime && ctx.gitLastMs - aMtime > 1000 * 60 * 60 * 24 * 30
+      ? Math.round((ctx.gitLastMs - aMtime) / (1000 * 60 * 60 * 24)) : null;
+
+  // baseline / changed detection
+  const hash = sha(text);
+  const prev = baseline && baseline[rel(artifact.path)];
+  const changed = !prev || prev.hash !== hash;
+
+  // Every CHANGED artifact warrants a semantic/context-drift pass — context drift
+  // (an out-of-date architecture/workflow description) usually has NO broken ref,
+  // so we must NOT gate the semantic pass on hard findings. Baseline/--changed-only
+  // is what controls cost; a fresh run (no baseline) treats everything as changed.
+  const hasHigh = dedupBroken.some((b) => b.confidence === "high" || b.severity === "broken");
+  const needsSemanticPass = changed;
 
   return {
     path: artifact.path,
+    rel: rel(artifact.path),
     type: artifact.type,
     scope: artifact.scope,
     frontmatter: fm,
-    refs,
-    brokenRefs,
-    recencyStaleDays: recencyStale,
+    brokenRefs: dedupBroken,
+    suppressed,
+    recencyStaleDays,
+    hash,
+    changed,
+    needsSemanticPass,
+    _hasHigh: hasHigh,
   };
 }
 
-function collectHookCommands(json, acc = []) {
-  if (!json || typeof json !== "object") return acc;
-  if (Array.isArray(json)) {
-    for (const x of json) collectHookCommands(x, acc);
-    return acc;
+// ---------------------------------------------------------------------------
+// Names (known skills/agents + common project prefix)
+// ---------------------------------------------------------------------------
+function collectNames(artifacts) {
+  const known = new Set();
+  for (const a of artifacts) {
+    if (a.type === "skill") known.add(path.basename(path.dirname(a.path)));
+    if (a.type === "agent" || a.type === "command") {
+      known.add(path.basename(a.path, ".md"));
+      const fm = extractFrontmatter(readText(a.path) || "");
+      if (fm.name) known.add(fm.name);
+    }
   }
-  for (const [k, v] of Object.entries(json)) {
-    if (k === "command" && typeof v === "string") acc.push(v);
-    else if (typeof v === "object") collectHookCommands(v, acc);
+  // common prefix up to first hyphen, shared by >=2 names
+  const prefixes = {};
+  for (const n of known) {
+    const m = n.match(/^([a-z0-9]+-)/);
+    if (m) prefixes[m[1]] = (prefixes[m[1]] || 0) + 1;
   }
-  return acc;
+  const prefix = Object.entries(prefixes).filter(([, c]) => c >= 2).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+  return { known, prefix };
 }
 
 function gitLastCommitMs(root) {
   try {
-    const out = execFileSync("git", ["-C", root, "log", "-1", "--format=%ct"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
+    const out = execFileSync("git", ["-C", root, "log", "-1", "--format=%ct"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
     return out ? parseInt(out, 10) * 1000 : null;
-  } catch {
-    return null;
+  } catch { return null; }
+}
+
+// ---------------------------------------------------------------------------
+// Reporting + merge
+// ---------------------------------------------------------------------------
+const SEV_RANK = { broken: 0, stale: 1, warning: 2, outdated: 3 };
+const SEV_EMOJI = { broken: "🔴", stale: "🟠", warning: "🟡", outdated: "🟡" };
+
+function flattenFindings(artifacts) {
+  const out = [];
+  for (const a of artifacts) {
+    for (const b of a.brokenRefs || []) {
+      out.push({
+        artifact: a.rel, scope: a.scope, type: a.type, source: "script",
+        severity: b.severity || "broken", confidence: b.confidence || "high",
+        ref: b.ref, kind: b.kind, reason: b.reason, suggestedEdit: null,
+      });
+    }
   }
+  return out;
+}
+
+// Merge auditor findings (array of {artifactPath, findings:[...]}) with script findings.
+function mergeAuditor(scriptFindings, auditor, root) {
+  const merged = [...scriptFindings];
+  for (const a of auditor || []) {
+    const aRel = (a.artifactPath || "").replace(root + path.sep, "");
+    for (const f of a.findings || []) {
+      // dedupe: a script finding whose ref appears in the auditor finding text
+      const dupe = merged.find(
+        (s) => s.artifact === aRel && s.source === "script" &&
+          (JSON.stringify(f).includes(s.ref) || (f.location || "").includes(s.ref))
+      );
+      if (dupe) {
+        dupe.source = "both";
+        dupe.severity = f.severity || dupe.severity;
+        dupe.reality = f.reality;
+        dupe.claim = f.claim;
+        dupe.evidence = f.evidence;
+        dupe.suggestedEdit = f.suggestedEdit || dupe.suggestedEdit;
+      } else {
+        merged.push({
+          artifact: aRel, scope: "project", source: "auditor",
+          severity: f.severity || "stale", confidence: "medium",
+          claim: f.claim, reality: f.reality, evidence: f.evidence,
+          ref: f.location, suggestedEdit: f.suggestedEdit || null,
+        });
+      }
+    }
+  }
+  return merged.sort((x, y) => (SEV_RANK[x.severity] ?? 9) - (SEV_RANK[y.severity] ?? 9));
+}
+
+function markdownReport(findings, summary) {
+  const lines = ["# ClaudeDrift report", "", `**${summary.totalFindings} findings** across ${summary.artifactCount} artifacts.`, ""];
+  const groups = { broken: [], stale: [], warning: [], outdated: [] };
+  for (const f of findings) (groups[f.severity] || groups.outdated).push(f);
+  const titles = { broken: "🔴 Broken", stale: "🟠 Stale", warning: "🟡 Warning", outdated: "🟡 Outdated" };
+  for (const sev of ["broken", "stale", "warning", "outdated"]) {
+    if (!groups[sev].length) continue;
+    lines.push(`## ${titles[sev]} (${groups[sev].length})`, "");
+    for (const f of groups[sev]) {
+      const what = f.ref || f.claim || "";
+      lines.push(`- **${f.artifact}** — \`${what}\`${f.confidence ? ` _(confidence: ${f.confidence}, via ${f.source})_` : ""}`);
+      if (f.reason) lines.push(`  - ${f.reason}`);
+      if (f.reality) lines.push(`  - reality: ${f.reality}`);
+      if (f.evidence) lines.push(`  - evidence: ${f.evidence}`);
+      if (f.suggestedEdit && f.suggestedEdit.old != null) lines.push(`  - fix: \`${f.suggestedEdit.old}\` → \`${f.suggestedEdit.new}\``);
+    }
+    lines.push("");
+  }
+  if (!findings.length) lines.push("✅ No significant drift detected.");
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -363,34 +609,69 @@ function main() {
     process.exit(0);
   }
 
-  const pkgScripts = loadPackageScripts(PROJECT_DIR);
-  const makeTargets = loadMakeTargets(PROJECT_DIR);
-  const gitLastMs = gitLastCommitMs(PROJECT_DIR);
+  const ctx = buildContext(PROJECT_DIR);
+  ctx.gitLastMs = gitLastCommitMs(PROJECT_DIR);
+  const baseline = changedOnly || writeBaseline ? readJSON(BASELINE_PATH) : null;
 
   let artifacts = discoverArtifacts(PROJECT_DIR, "project");
-  if (includeUser && exists(USER_CLAUDE)) {
-    artifacts = artifacts.concat(discoverArtifacts(USER_CLAUDE, "user"));
+  if (includeUser && exists(USER_CLAUDE)) artifacts = artifacts.concat(discoverArtifacts(USER_CLAUDE, "user"));
+
+  const names = collectNames(artifacts);
+  let results = artifacts.map((a) => verifyArtifact(a, PROJECT_DIR, ctx, names, baseline));
+
+  // --baseline: persist current state and exit
+  if (writeBaseline) {
+    const state = {};
+    for (const r of results) state[r.rel] = { hash: r.hash, type: r.type };
+    try {
+      fs.mkdirSync(path.dirname(BASELINE_PATH), { recursive: true });
+      fs.writeFileSync(BASELINE_PATH, JSON.stringify(state, null, 2));
+      console.log(JSON.stringify({ ok: true, baseline: BASELINE_PATH, artifacts: results.length }));
+    } catch (e) {
+      console.log(JSON.stringify({ error: String(e) }));
+    }
+    process.exit(0);
   }
 
-  const results = artifacts.map((a) =>
-    verifyArtifact(a, PROJECT_DIR, pkgScripts, makeTargets, gitLastMs)
-  );
+  if (changedOnly) results = results.filter((r) => r.changed);
 
-  const totalBroken = results.reduce((n, r) => n + (r.brokenRefs?.length || 0), 0);
+  let findings = flattenFindings(results);
+
+  // --merge: fold in auditor JSON
+  if (mergeFile) {
+    const auditor = readJSON(mergeFile);
+    findings = mergeAuditor(findings, Array.isArray(auditor) ? auditor : auditor?.findings || [], PROJECT_DIR);
+  }
+
+  const summary = {
+    artifactCount: results.length,
+    artifactsWithFindings: results.filter((r) => (r.brokenRefs?.length || 0) > 0).length,
+    totalFindings: findings.length,
+    bySeverity: findings.reduce((m, f) => ((m[f.severity] = (m[f.severity] || 0) + 1), m), {}),
+    artifactsNeedingSemanticPass: results.filter((r) => r.needsSemanticPass).map((r) => r.rel),
+    suppressedCount: results.reduce((n, r) => n + (r.suppressed?.length || 0), 0),
+  };
+
   const output = {
     projectDir: PROJECT_DIR,
     scannedUser: includeUser,
-    hasPackageJson: pkgScripts != null,
-    hasMakefile: makeTargets != null,
-    summary: {
-      artifactCount: results.length,
-      artifactsWithBrokenRefs: results.filter((r) => (r.brokenRefs?.length || 0) > 0).length,
-      totalBrokenRefs: totalBroken,
-    },
-    artifacts: results,
+    context: { hasPackageJson: !!ctx.npmScripts, hasComposer: !!ctx.composerScripts, hasMakefile: !!ctx.makeTargets, hasEnvoy: !!ctx.envoyTasks, hasEnvExample: !!ctx.envKeys },
+    summary,
+    findings,
+    artifacts: results.map(({ _hasHigh, ...r }) => r),
   };
 
+  if (reportPath) {
+    try { fs.writeFileSync(reportPath, markdownReport(findings, summary)); output.reportWritten = reportPath; } catch (e) { output.reportError = String(e); }
+  }
+
   process.stdout.write(JSON.stringify(output, null, 2) + "\n");
+
+  if (ciMode) {
+    const threshold = failOn === "any" ? 9 : SEV_RANK[failOn] ?? 0;
+    const hit = findings.some((f) => (SEV_RANK[f.severity] ?? 9) <= threshold);
+    process.exit(hit ? 1 : 0);
+  }
 }
 
 main();
