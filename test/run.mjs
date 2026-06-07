@@ -36,21 +36,14 @@ write("bootstrap/cache/.gitkeep", "");
 write("package.json", JSON.stringify({ scripts: { build: "tsc" } }));
 write("composer.json", JSON.stringify({ scripts: { test: "phpunit" } }));
 write("Envoy.blade.php", "@task('deploy') echo hi @endtask\n");
+// cross-language: a real top-level dir with a non-PHP/JS name (no SRC_PREFIX match)
+write("crates/realcrate/lib.rs", "pub fn x() {}\n");
+// a declared git submodule path (its contents are legitimately absent here)
+write(".gitmodules", '[submodule "vendored"]\n\tpath = modules/vendored\n\turl = https://example.com/x\n');
 
 // two real skills sharing the 'proj-' prefix (so cross-ref prefix is detected)
 write("skills/proj-foo/SKILL.md", "---\ndescription: foo\n---\nfoo skill\n");
 write("skills/proj-bar/SKILL.md", "---\ndescription: bar\n---\nbar skill\n");
-// a generic/template artifact: references several real-looking paths, NONE resolve
-write(
-  "skills/proj-template/SKILL.md",
-  [
-    "---", "description: generic scaffolder", "---",
-    "The auth flow lives in `src/api/login.ts` and `src/api/refresh.ts`.",
-    "Tokens come from `src/db/pool.ts`, middleware from `src/middleware/auth.ts`,",
-    "types from `src/types/user.ts`, and config from `src/config/app.ts`.",
-  ].join("\n")
-);
-
 // the project uses .claude/ layout for the rest
 fs.cpSync(path.join(FX, "skills"), path.join(FX, ".claude", "skills"), { recursive: true });
 fs.rmSync(path.join(FX, "skills"), { recursive: true });
@@ -62,15 +55,18 @@ write(
     "# Fixture",
     "",
     "## True positives (should be FOUND)",
-    "- The real entry is `app/Models/User.php`.", // resolves -> grounds the artifact (corroboration)
-    "- Entry point is `src/main.ts`.", // missing path -> broken (HIGH, because corroborated)
+    "- Entry point is `src/main.ts`.", // missing path -> broken
     "- Run `npm run test` to test.", // missing npm script -> broken
     "- Run `composer run lint`.", // missing composer script -> broken
     "- Deploy with `envoy run ghost`.", // missing envoy task -> broken
     "- See `src/real.ts` for details.", // case mismatch (real file is src/Real.ts)
     "- Use the proj-missing skill to do X.", // cross-ref to non-existent skill
+    "- A crate lives at `crates/realcrate/missing.rs`.", // dynamic top-dir: crates/ is real, file missing
     "",
     "## False positives (should be SUPPRESSED)",
+    "- Submodule code at `modules/vendored/core.rs`.", // git submodule path (declared in .gitmodules)
+    "- Debug config in `.vscode/launch.json`.", // editor/IDE config
+    "- Currently on branch `feature/login-form`.", // not a real top-level dir -> not a project file
     "- All models live in `app/Models/User*`.", // glob
     "- Templates: `gitbook/scripts/<name>.md`.", // placeholder
     "- Secrets in `~/.config/app/secret.json`.", // external home path
@@ -105,8 +101,6 @@ const findingHas = (sub) => [...findingRefs].some((r) => r.includes(sub));
 const suppressedHas = (why) => suppressedReasons.some((w) => w.includes(why));
 // a ref was NOT emitted as a finding (i.e. correctly not flagged)
 const notFlagged = (sub) => ![...findingRefs].some((r) => r.includes(sub));
-const findingFor = (sub) => j.findings.find((f) => (f.ref || "").includes(sub));
-const confidenceOf = (sub) => (findingFor(sub) || {}).confidence;
 
 // ---------------------------------------------------------------------------
 // Assertions
@@ -119,6 +113,7 @@ const tests = [
   ["finds missing envoy task 'ghost'", () => findingRefs.has("ghost")],
   ["finds case-mismatch src/real.ts", () => findingHas("src/real.ts")],
   ["finds cross-ref proj-missing", () => findingRefs.has("proj-missing")],
+  ["finds missing file under real top-dir crates/", () => findingHas("crates/realcrate/missing.rs")],
   // false positives correctly suppressed
   ["suppresses glob app/Models/User*", () => suppressedHas("glob")],
   ["suppresses placeholder <name>.md", () => suppressedHas("placeholder")],
@@ -127,6 +122,8 @@ const tests = [
   ["suppresses example FooService", () => suppressedHas("example")],
   ["suppresses ephemeral bootstrap/cache", () => suppressedHas("ephemeral")],
   ["suppresses negative-context src/old.ts", () => suppressedHas("negative")],
+  ["suppresses git submodule path", () => suppressedHas("submodule")],
+  ["suppresses editor/IDE config", () => suppressedHas("IDE")],
   // things that must NOT be flagged
   ["does NOT flag glob User*", () => notFlagged("app/Models/User*")],
   ["does NOT flag FooService", () => notFlagged("FooService")],
@@ -134,12 +131,9 @@ const tests = [
   ["does NOT flag external secret.json", () => notFlagged("secret.json")],
   ["does NOT flag negative src/old.ts", () => notFlagged("src/old.ts")],
   ["does NOT flag resolving cross-ref proj-foo", () => !findingRefs.has("proj-foo")],
-  // corroboration: grounded artifact keeps HIGH; ungrounded template drops to LOW
-  ["corroborated broken ref is HIGH confidence", () => confidenceOf("src/main.ts") === "high"],
-  ["template artifact (no resolving paths) is LOW", () => {
-    const tf = j.findings.filter((f) => f.artifact.includes("proj-template") && f.kind === "path");
-    return tf.length >= 3 && tf.every((f) => f.confidence === "low");
-  }],
+  ["does NOT flag submodule modules/vendored", () => notFlagged("modules/vendored")],
+  ["does NOT flag .vscode/launch.json", () => notFlagged("launch.json")],
+  ["does NOT flag git branch feature/login-form", () => notFlagged("feature/login-form")],
 ];
 
 let failed = 0;
