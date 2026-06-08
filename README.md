@@ -4,8 +4,8 @@
 
 ### Your `CLAUDE.md`, skills, and agents rot as your code changes. ClaudeDrift finds out where — and fixes it.
 
-[![version](https://img.shields.io/badge/version-0.4.0-blue)](https://github.com/marky291/ClaudeDrift/releases)
-[![tests](https://img.shields.io/badge/tests-35%20passing-brightgreen)](./test/run.mjs)
+[![version](https://img.shields.io/badge/version-0.4.1-blue)](https://github.com/marky291/ClaudeDrift/releases)
+[![tests](https://img.shields.io/badge/tests-37%20passing-brightgreen)](./test/run.mjs)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-8A63D2)](https://code.claude.com/docs/en/plugins)
 [![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![zero deps](https://img.shields.io/badge/dependencies-0-blue)](./scripts/discover.mjs)
@@ -89,24 +89,44 @@ ClaudeDrift report — 2 findings across 13 artifacts (256 candidates analyzed)
 
 Then it offers to apply the fix and re-verifies it's gone.
 
+> **A more dangerous one.** In a real TypeScript repo (2anki/server, 37 Claude
+> artifacts) ClaudeDrift flagged `src/lib/Token.ts` as missing — and it was. That
+> path sat in the `HARD_BLOCK_PATHS` safety list of **three** agents/commands,
+> gating real "stop and use a worktree" logic on a file that no longer exists. The
+> guard had quietly become a no-op. No grep would have told you the *guard itself*
+> was dead.
+
 ## Why you can trust the findings
 
 False positives kill tools like this. ClaudeDrift is tuned for precision and was
-**validated across 6 language ecosystems** (PHP, Elixir, Python, C#, JavaScript,
-Rust/Lua) — every false positive became a general rule, not a hack:
+**validated against 8 real repos across 7 ecosystems** (PHP, Go, Python, C#, Ruby,
+Rust, TypeScript) — including monorepos and repos with 30+ skills/agents/commands.
+Every false positive found became a general rule, not a hack:
 
-- **Knows what to ignore:** globs, `<placeholders>`, `$SHELL_VARS`, `~/` and
-  absolute machine paths, example names (`FooService`), runtime-generated files,
-  and anything in your `.gitignore` (secrets, local settings, build output).
-- **Reads context:** a file a doc says it *creates* — or documents as *removed* —
-  is never flagged as missing.
-- **Corroboration rule:** a broken path is only **high confidence** if the same
-  artifact also names a path that *does* resolve — proof it really describes *this*
-  repo. Ungrounded artifacts are flagged low and left for the semantic pass, so you
-  never get drowned in noise.
+- **Language-agnostic:** a path "looks real" when its first segment is an actual
+  top-level directory of *your* project — no hardcoded `src`/`app` assumptions. Works
+  for Go (`internal/`), C# (`modules/`), Rust (`crates/`), any layout.
+- **Knows what to ignore:** globs, `<placeholders>`, `$SHELL_VARS`, `~/` and absolute
+  machine paths, example names (`FooService`), `file:line` citations, build output,
+  git-submodule paths, editor configs, and anything in your `.gitignore`.
+- **Reads context:** a file a doc says it *creates*, documents as *removed*, or shows
+  as *example output* (`e.g.`, fenced sample blocks in agents) is downgraded, not
+  flagged as real drift.
+- **Monorepo-aware:** scripts are checked across *all* `package.json`/`composer.json`
+  files; a path written relative to a sub-crate is low-confidence, not a false alarm.
+- **Corroboration rule:** a broken path is **high confidence** only if the artifact
+  also names a path that *does* resolve — proof it really describes *this* repo.
 
 Every finding carries a **confidence** level and **evidence**. Every ignored
 candidate is listed with a reason, so the tool is fully auditable.
+
+## Preflight: no false alarms from uninstalled deps
+
+Before validating, ClaudeDrift checks that your dependencies are actually installed
+— `node_modules`, `vendor/`, a Python virtualenv, initialized git submodules. If
+something's missing it tells you up front (with the fix command) rather than
+drowning you in "missing reference" findings that are really just *not installed
+yet*. One less way to get a misleading report.
 
 ## What it audits
 
@@ -134,6 +154,7 @@ artifact is what's wrong — ClaudeDrift never edits your code.
 The bundled scanner also runs standalone (and in CI):
 
 ```bash
+node scripts/discover.mjs <projectDir> --preflight         # check deps are installed first
 node scripts/discover.mjs <projectDir> --report drift.md   # markdown report
 node scripts/discover.mjs <projectDir> --baseline          # snapshot for --changed-only
 node scripts/discover.mjs <projectDir> --ci --fail-on broken # exit non-zero on drift
@@ -143,6 +164,8 @@ See a full sample report in [`docs/example-drift-report.md`](./docs/example-drif
 
 ## How it works
 
+0. **Preflight** — confirm dependencies/submodules are installed so uninstalled
+   packages don't masquerade as drift.
 1. **`scripts/discover.mjs`** (Node, **zero dependencies**) enumerates every
    artifact and hard-verifies the concrete references inside them against the live
    filesystem and package manifests, applying the precision rules above. Node is
@@ -159,8 +182,8 @@ See a full sample report in [`docs/example-drift-report.md`](./docs/example-drif
 ClaudeDrift/
 ├── skills/drift-check/SKILL.md   # the /claude-drift:drift-check command
 ├── agents/drift-auditor.md       # per-artifact semantic (context-drift) auditor
-├── scripts/discover.mjs          # deterministic scanner + merge/baseline/ci
-└── test/run.mjs                  # 35-case precision regression suite
+├── scripts/discover.mjs          # deterministic scanner + preflight/merge/baseline/ci
+└── test/run.mjs                  # 37-case precision regression suite
 ```
 
 ## Roadmap
@@ -172,7 +195,7 @@ ClaudeDrift/
 ## Contributing
 
 ```bash
-npm test    # 35-case precision regression suite
+npm test    # 37-case precision regression suite
 ```
 
 Found a false positive in your ecosystem? Open an issue with the artifact snippet —

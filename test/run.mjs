@@ -62,6 +62,17 @@ write(
 fs.cpSync(path.join(FX, "skills"), path.join(FX, ".claude", "skills"), { recursive: true });
 fs.rmSync(path.join(FX, "skills"), { recursive: true });
 
+// an agent with a real ref (so corroboration does NOT fire) plus a fenced sample
+// block whose path is illustrative — must be downgraded to LOW by the fence rule.
+write(
+  ".claude/agents/demo-agent.md",
+  [
+    "---", "name: demo-agent", "description: d", "---",
+    "Real file: `src/Real.ts`.", // resolves -> grounds the artifact
+    "Sample output:", "```", "[unreferenced] web/src/Gone.tsx", "```",
+  ].join("\n")
+);
+
 // CLAUDE.md packed with every case
 write(
   "CLAUDE.md",
@@ -77,6 +88,7 @@ write(
     "- See `src/real.ts` for details.", // case mismatch (real file is src/Real.ts)
     "- Use the proj-missing skill to do X.", // cross-ref to non-existent skill
     "- A crate lives at `crates/realcrate/missing.rs`.", // dynamic top-dir: crates/ real, file missing
+    "- For example see `app/Models/Ghost.php`.", // example-context -> LOW (app is real top-dir, file missing)
     "",
     "## False positives (should be SUPPRESSED)",
     "- Submodule code at `modules/vendored/core.rs`.", // git submodule path (declared in .gitmodules)
@@ -155,6 +167,14 @@ const tests = [
   ["does NOT flag shared.css:78 (file exists; strip :line)", () => notFlagged("shared.css")],
   ["crate-relative path is LOW confidence", () => {
     const f = j.findings.find((x) => (x.ref || "").includes("someCrate/src/lib.rs"));
+    return f && f.confidence === "low";
+  }],
+  ["example-context ref is LOW confidence", () => {
+    const f = j.findings.find((x) => (x.ref || "").includes("app/Models/Ghost.php"));
+    return f && f.confidence === "low";
+  }],
+  ["agent fenced sample path is LOW confidence", () => {
+    const f = j.findings.find((x) => (x.ref || "").includes("web/src/Gone.tsx"));
     return f && f.confidence === "low";
   }],
   // things that must NOT be flagged

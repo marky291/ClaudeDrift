@@ -292,6 +292,12 @@ const NEGATIVE =
 // The artifact is describing a file it CREATES (an output), not one it references.
 const CREATION =
   /\b(creat(e|es|ed|ing)|generat(e|es|ed|ing)|writ(e|es|ten|ing)\b|output(s|ted)?|produc(e|es|ed)|scaffold(s|ed)?|stub(s|bed)?|new file|save(d|s)? (to|as)|stored? (in|at))\b/i;
+// Illustrative/example context — the path is a sample, not an assertion the file
+// exists. Downgrades confidence (keeps the finding for the semantic pass).
+// Note: no leading \b — these markers often sit next to `*`/`(` (e.g. `**Example**:`,
+// `(e.g., …)`) where a word boundary fails. Each alternative carries its own anchor.
+const EXAMPLE_CONTEXT =
+  /\bfor example\b|\bfor instance\b|\bsuch as\b|e\.g\.|\*\*examples?\*\*|\bexamples?\s*[:)]|\bsample (output|input|response|report)\b|\bunreferenced\b|\blast (touched|modified)\b/i;
 
 const CODE_EXT = new Set([
   ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rb", ".go", ".rs",
@@ -333,6 +339,16 @@ function codeRanges(text) {
 }
 const inRanges = (ranges, i) => ranges.some(([s, e]) => i >= s && i < e);
 
+// Fenced code blocks only (``` … ``` / ~~~ … ~~~). In instructional artifacts
+// (agents/commands) these usually hold sample I/O with illustrative paths.
+function fenceRanges(text) {
+  const ranges = [];
+  let m;
+  const fence = /```[\s\S]*?```|~~~[\s\S]*?~~~/g;
+  while ((m = fence.exec(text))) ranges.push([m.index, m.index + m[0].length]);
+  return ranges;
+}
+
 // Yield path candidates with index + neighbouring chars.
 function* pathCandidates(text) {
   // backticked tokens
@@ -353,7 +369,7 @@ function* pathCandidates(text) {
   }
 }
 
-function classifyPath(cand, text, root, artifactPath, ctx) {
+function classifyPath(cand, text, root, artifactPath, ctx, opts = {}) {
   const { raw, idx, before, after } = cand;
   const refRaw = raw;
   // strip a trailing file:line[:col] citation (common in agent docs: `foo.ts:78`)
@@ -438,9 +454,17 @@ function classifyPath(cand, text, root, artifactPath, ctx) {
   // anchored to the project root. A multi-segment ref is anchored only if its
   // first segment is a real top-level directory.
   const anchored = refClean.split("/").length === 1 || topDirs.has(firstSeg);
-  return anchored
-    ? { emit: { ref, kind: "path", severity: "broken", confidence: "high", reason: "path not found on disk" } }
-    : { emit: { ref, kind: "path", severity: "broken", confidence: "low", reason: "path not found; first segment is not a project top-level dir (may be relative to a subdir/crate)" } };
+
+  // Illustrative context downgrades to low: an example line ("e.g. `x`"), or a
+  // path inside a fenced sample block of an instructional artifact (agent/command).
+  const exampleCtx = EXAMPLE_CONTEXT.test(ctxLine);
+  const inSampleFence = opts.instructional && opts.fences && inRanges(opts.fences, idx);
+  if (anchored && !exampleCtx && !inSampleFence)
+    return { emit: { ref, kind: "path", severity: "broken", confidence: "high", reason: "path not found on disk" } };
+  const reason = exampleCtx || inSampleFence
+    ? "path not found; appears in example/sample context — likely illustrative (needs semantic review)"
+    : "path not found; first segment is not a project top-level dir (may be relative to a subdir/crate)";
+  return { emit: { ref, kind: "path", severity: "broken", confidence: "low", reason } };
 }
 
 function namespaceLike(ref, root) {
@@ -605,8 +629,13 @@ function verifyArtifact(artifact, root, ctx, names, baseline) {
   const suppressed = [];
   let resolvedReal = 0;
 
+  // Agents/commands are instructional — paths in their fenced sample blocks are
+  // usually illustrative output, so downgrade those to low.
+  const instructional = artifact.type === "agent" || artifact.type === "command";
+  const fences = instructional ? fenceRanges(text) : null;
+
   for (const cand of pathCandidates(text)) {
-    const res = classifyPath(cand, text, root, artifact.path, ctx);
+    const res = classifyPath(cand, text, root, artifact.path, ctx, { instructional, fences });
     if (!res) continue;
     if (res.ok) resolvedReal++;
     else if (res.suppress) suppressed.push(res.suppress);

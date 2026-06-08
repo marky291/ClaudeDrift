@@ -3,6 +3,27 @@
 All notable changes to ClaudeDrift are documented here. This project follows
 [semantic versioning](https://semver.org/).
 
+## [0.4.1] — Example/sample-output precision
+
+Continued rich-artifact validation surfaced one more false-positive class:
+illustrative paths in agent/skill instructions.
+
+### Added
+- **Example-context downgrade** — paths in lines marked `e.g.`, `for example`,
+  `**Example**:`, `such as`, or sample-report markers (`unreferenced`, `last
+  touched`) are downgraded to low confidence (kept for the semantic pass).
+- **Agent/command fenced sample blocks** — paths inside ``` fences in agents and
+  commands (where sample I/O lives) are downgraded to low.
+
+### Fixed
+- Example-context regex no longer fails next to `**`/`(` (a leading `\b` broke
+  `**Example**` and `e.g.`).
+
+### Results
+- ts2anki high-confidence findings cut to only genuine drift, independently
+  confirmed by the semantic auditor (e.g. `src/lib/Token.ts` referenced in three
+  agents' `HARD_BLOCK_PATHS` safety lists but absent from the repo). Suite: 37 cases.
+
 ## [0.4.0] — Rich-artifact validation + preflight
 
 Validated against real repositories with **populated `.claude/` surfaces** —
