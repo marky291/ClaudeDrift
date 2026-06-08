@@ -36,6 +36,9 @@ write("bootstrap/cache/.gitkeep", "");
 write("package.json", JSON.stringify({ scripts: { build: "tsc" } }));
 write("composer.json", JSON.stringify({ scripts: { test: "phpunit" } }));
 write("Envoy.blade.php", "@task('deploy') echo hi @endtask\n");
+// nested manifest (monorepo): a script defined only in a subproject's package.json
+write("web/package.json", JSON.stringify({ scripts: { "test:e2e": "playwright" } }));
+write("web/src/styles/shared.css", ".x{}\n"); // real file referenced as shared.css:78
 // cross-language: a real top-level dir with a non-PHP/JS name (no SRC_PREFIX match)
 write("crates/realcrate/lib.rs", "pub fn x() {}\n");
 // a declared git submodule path (its contents are legitimately absent here)
@@ -79,6 +82,12 @@ write(
     "- Submodule code at `modules/vendored/core.rs`.", // git submodule path (declared in .gitmodules)
     "- Debug config in `.vscode/launch.json`.", // editor/IDE config
     "- Currently on branch `feature/login-form`.", // not a real top-level dir -> not a project file
+    "- Run `pnpm --filter web build` for the UI.", // --filter is a flag, not a script
+    "- E2E lives in the web subproject: `pnpm run test:e2e`.", // script in nested web/package.json
+    "- Token offsets at `web/src/styles/shared.css:78`.", // file:line citation -> strip :78, file exists
+    "- Output goes to `web/build/assets/main.js`.", // build output / generated dir
+    "- Crate-relative path `someCrate/src/lib.rs`.", // first segment not a top-level dir -> LOW, not HIGH
+    "- Specs go in `docs/spec-`.", // truncated template reference
     "- All models live in `app/Models/User*`.", // glob
     "- Templates: `gitbook/scripts/<name>.md`.", // placeholder
     "- Secrets in `~/.config/app/secret.json`.", // external home path
@@ -138,6 +147,16 @@ const tests = [
   ["suppresses negative-context src/old.ts", () => suppressedHas("negative")],
   ["suppresses git submodule path", () => suppressedHas("submodule")],
   ["suppresses editor/IDE config", () => suppressedHas("IDE")],
+  ["suppresses build output dir (web/build)", () => suppressedHas("build output")],
+  ["suppresses truncated template ref (docs/spec-)", () => suppressedHas("template")],
+  // nested-manifest, file:line, flag, crate-relative
+  ["does NOT flag --filter as npm-script", () => notFlagged("filter")],
+  ["does NOT flag test:e2e (defined in web/package.json)", () => !findingRefs.has("test:e2e")],
+  ["does NOT flag shared.css:78 (file exists; strip :line)", () => notFlagged("shared.css")],
+  ["crate-relative path is LOW confidence", () => {
+    const f = j.findings.find((x) => (x.ref || "").includes("someCrate/src/lib.rs"));
+    return f && f.confidence === "low";
+  }],
   // things that must NOT be flagged
   ["does NOT flag glob User*", () => notFlagged("app/Models/User*")],
   ["does NOT flag FooService", () => notFlagged("FooService")],
@@ -148,6 +167,9 @@ const tests = [
   ["does NOT flag submodule modules/vendored", () => notFlagged("modules/vendored")],
   ["does NOT flag .vscode/launch.json", () => notFlagged("launch.json")],
   ["does NOT flag git branch feature/login-form", () => notFlagged("feature/login-form")],
+  // preflight: deps not installed should be flagged before validation
+  ["preflight warns missing node_modules", () => (j.preflight?.warnings || []).some((w) => w.missing === "node_modules")],
+  ["preflight warns uninitialized submodule", () => (j.preflight?.warnings || []).some((w) => w.tool === "git")],
   // corroboration: grounded artifact keeps HIGH; ungrounded template drops to LOW
   ["corroborated broken ref is HIGH confidence", () => confidenceOf("src/main.ts") === "high"],
   ["template artifact (no resolving paths) is LOW", () => {

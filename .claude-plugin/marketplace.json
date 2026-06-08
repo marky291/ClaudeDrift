@@ -12,7 +12,7 @@
       "name": "claude-drift",
       "source": "./",
       "description": "Detects and fixes drift between a project's Claude artifacts and its actual current reality.",
-      "version": "0.3.0"
+      "version": "0.4.0"
     }
   ]
 }

@@ -26,11 +26,32 @@ Arguments (`$ARGUMENTS`):
 - `--ci` — non-interactive: write the report and stop (no apply).
 - a path — audit a different project directory instead of `$CLAUDE_PROJECT_DIR`.
 
+## Step 0 — Preflight: are dependencies installed?
+
+Before validating, check that the project's dependencies and submodules are
+installed — otherwise references *into* uninstalled packages show up as false
+"missing reference" drift.
+
+```
+!`node "${CLAUDE_PLUGIN_ROOT}/scripts/discover.mjs" "${CLAUDE_PROJECT_DIR:-$PWD}" --preflight 2>/dev/null`
+```
+
+Read the `preflight` object. If `clean` is true, proceed silently. If it has
+`warnings` (e.g. `node_modules`/`vendor` missing, an uninitialized submodule),
+**surface them to the user first** and note that some findings may be false
+positives until those are installed. Offer to run the suggested `fix` command
+(e.g. `npm install`, `composer install`, `git submodule update --init`) before
+continuing — but do not run installs without the user's go-ahead. The user may
+choose to proceed anyway; that's fine, just keep the caveat in the final report.
+
 ## Step 1 — Deterministic discovery + hard checks
 
 ```
 !`node "${CLAUDE_PLUGIN_ROOT}/scripts/discover.mjs" "${CLAUDE_PROJECT_DIR:-$PWD}" $ARGUMENTS 2>/dev/null`
 ```
+
+(The full run also includes the same `preflight` object, so re-surface any
+warnings in the report header if the user proceeded without installing.)
 
 Parse the JSON. Key fields:
 - `artifacts[]` — each with `rel`, `type`, `brokenRefs` (already-verified reference

@@ -43,6 +43,7 @@ const mergeFile = opt("--merge");
 const writeBaseline = flag("--baseline");
 const changedOnly = flag("--changed-only");
 const ciMode = flag("--ci");
+const preflightOnly = flag("--preflight");
 const failOn = opt("--fail-on", "broken");
 
 const positional = argv.filter(
@@ -152,8 +153,21 @@ function discoverArtifacts(root, scope) {
 // Reality context (manifests / known commands / artifact names)
 // ---------------------------------------------------------------------------
 function buildContext(root) {
-  const pkg = readJSON(path.join(root, "package.json"));
-  const composer = readJSON(path.join(root, "composer.json"));
+  // Union scripts across ALL package.json / composer.json files (monorepos &
+  // subprojects keep their own — e.g. web/package.json), not just the root one,
+  // so a script defined in a nested manifest isn't reported as missing.
+  const collectScripts = (filename) => {
+    const names = new Set();
+    let any = false;
+    for (const p of walk(root, (_f, name) => name === filename, 6)) {
+      const j = readJSON(p);
+      if (j && j.scripts) { any = true; for (const k of Object.keys(j.scripts)) names.add(k); }
+      else if (j) any = true; // manifest exists even with no scripts
+    }
+    return any ? [...names] : null;
+  };
+  const npmScriptsAll = collectScripts("package.json");
+  const composerScriptsAll = collectScripts("composer.json");
 
   const makeText = readText(path.join(root, "Makefile")) || readText(path.join(root, "makefile"));
   const makeTargets = makeText
@@ -208,8 +222,8 @@ function buildContext(root) {
   const submodulePaths = gm ? [...gm.matchAll(/^\s*path\s*=\s*(.+)$/gm)].map((m) => m[1].trim()) : [];
 
   return {
-    npmScripts: pkg && pkg.scripts ? Object.keys(pkg.scripts) : null,
-    composerScripts: composer && composer.scripts ? Object.keys(composer.scripts) : null,
+    npmScripts: npmScriptsAll,
+    composerScripts: composerScriptsAll,
     makeTargets,
     justRecipes,
     justHasModules,
@@ -259,6 +273,7 @@ const NPM_BUILTINS = new Set([
   "dedupe", "store", "publish", "pack", "init", "create", "import", "rebuild", "run",
   "run-script", "fund", "view", "info", "config", "cache", "patch", "approve-builds",
   "dedupe", "licenses", "doctor", "ping", "owner", "deprecate", "dist-tag", "set", "get",
+  "workspace", "workspaces",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -296,11 +311,13 @@ const looksLikePath = (s) =>
   !/\s/.test(s) && !s.startsWith("$") && !s.includes("${") && s.length < 200;
 
 function contextWindow(text, idx) {
+  // The CURRENT line only — spanning the previous line lets a creation/negative
+  // word from an adjacent (unrelated) bullet bleed onto this ref and wrongly
+  // suppress it.
   const lineStart = text.lastIndexOf("\n", idx) + 1;
   let lineEnd = text.indexOf("\n", idx);
   if (lineEnd < 0) lineEnd = text.length;
-  const prevStart = text.lastIndexOf("\n", lineStart - 2) + 1;
-  return text.slice(prevStart, lineEnd);
+  return text.slice(lineStart, lineEnd);
 }
 
 // Byte ranges covered by inline code spans / fenced code blocks. Commands are
@@ -339,7 +356,8 @@ function* pathCandidates(text) {
 function classifyPath(cand, text, root, artifactPath, ctx) {
   const { raw, idx, before, after } = cand;
   const refRaw = raw;
-  const ref = norm(raw.replace(GLOB_CHARS, ""));
+  // strip a trailing file:line[:col] citation (common in agent docs: `foo.ts:78`)
+  const ref = norm(raw.replace(GLOB_CHARS, "")).replace(/:\d+(?::\d+)?$/, "");
   const topDirs = ctx?.topDirs || new Set();
   const submodulePaths = ctx?.submodulePaths || [];
 
@@ -362,6 +380,8 @@ function classifyPath(cand, text, root, artifactPath, ctx) {
   if (PLACEHOLDER_PATH.test(ref)) return { suppress: { ref, why: "instructional placeholder path" } };
   // example/placeholder class or file names
   if (EXAMPLE_NAME.test(ref)) return { suppress: { ref, why: "example/placeholder name" } };
+  // incomplete/template ref left dangling on a separator (e.g. `docs/spec-` from `docs/spec-<id>`)
+  if (/[-_]$/.test(ref)) return { suppress: { ref, why: "incomplete/template reference" } };
   // git submodule contents — legitimately absent until `git submodule update`
   const refClean = ref.replace(/^\.\//, "");
   if (submodulePaths.some((s) => refClean === s || refClean.startsWith(s + "/"))) return { suppress: { ref, why: "git submodule path (may be uninitialized)" } };
@@ -396,6 +416,8 @@ function classifyPath(cand, text, root, artifactPath, ctx) {
 
   // runtime-generated / ephemeral — legitimately absent on a fresh clone
   if (EPHEMERAL.test(ref)) return { suppress: { ref, why: "runtime-generated/ephemeral path" } };
+  // build output / generated directory anywhere in the path (web/build/, dist/, target/)
+  if (/(?:^|\/)(?:build|dist|out|target|coverage|node_modules|\.next|\.nuxt)\//.test(ref)) return { suppress: { ref, why: "build output / generated dir" } };
 
   const ctxLine = contextWindow(text, idx);
   // negative context — the doc is *describing* the absence, not asserting presence
@@ -406,7 +428,19 @@ function classifyPath(cand, text, root, artifactPath, ctx) {
   // namespace-like: no extension, PascalCase tail, sibling .php files exist
   if (!ext && namespaceLike(ref, root)) return { suppress: { ref, why: "namespace-like (matching class exists)" } };
 
-  return { emit: { ref, kind: "path", severity: "broken", confidence: "high", reason: "path not found on disk" } };
+  // High confidence only if the ref is anchored to a REAL project top-level dir.
+  // SRC_PREFIX is a guess (it lets `routes/x` look real even with no routes/ dir),
+  // so it must NOT raise confidence — only an actual top-level dir match does.
+  // Otherwise the ref is likely written relative to a subdir/crate/package we can't
+  // see (monorepo `hashql-mir/src/...` → really `libs/@local/hashql/mir/...`), so
+  // downgrade to low and let the semantic pass adjudicate.
+  // A single-segment ref (e.g. `./run.sh`, `Makefile`) is a root-level file —
+  // anchored to the project root. A multi-segment ref is anchored only if its
+  // first segment is a real top-level directory.
+  const anchored = refClean.split("/").length === 1 || topDirs.has(firstSeg);
+  return anchored
+    ? { emit: { ref, kind: "path", severity: "broken", confidence: "high", reason: "path not found on disk" } }
+    : { emit: { ref, kind: "path", severity: "broken", confidence: "low", reason: "path not found; first segment is not a project top-level dir (may be relative to a subdir/crate)" } };
 }
 
 function namespaceLike(ref, root) {
@@ -448,6 +482,7 @@ function checkCommands(text, ctx) {
       if (!inRanges(ranges, m.index)) continue; // ignore prose ("just the right way")
       const after = text[m.index + m[0].length] || "";
       if (after === "{" || after === "*" || after === ",") continue; // brace/glob expansion, not a literal name
+      if (/^-/.test(m[1])) continue; // a CLI flag (e.g. `pnpm --filter web build`), not a script name
       const name = m[1].replace(/[-:]+$/, ""); // strip trailing punctuation contamination
       if (!name || (skip && skip(name))) continue;
       if (known.includes(name)) continue;
@@ -666,6 +701,44 @@ function gitLastCommitMs(root) {
 }
 
 // ---------------------------------------------------------------------------
+// Preflight: are the project's dependencies installed? Uninstalled deps and
+// uninitialized submodules make references INTO them look like drift, so we
+// surface these as warnings up front to reduce false positives at validation.
+// ---------------------------------------------------------------------------
+function checkPreflight(root) {
+  const warnings = [];
+  const ok = [];
+  const dirEmpty = (p) => { try { return fs.readdirSync(p).length === 0; } catch { return true; } };
+
+  // package.json → node_modules (any common manager)
+  if (exists(path.join(root, "package.json"))) {
+    if (exists(path.join(root, "node_modules")) && !dirEmpty(path.join(root, "node_modules"))) ok.push("node_modules");
+    else warnings.push({ tool: "node", missing: "node_modules", fix: "npm install (or pnpm/yarn/bun install)", message: "package.json present but node_modules/ is missing — dependencies are not installed." });
+  }
+  // composer.json → vendor
+  if (exists(path.join(root, "composer.json"))) {
+    if (exists(path.join(root, "vendor")) && !dirEmpty(path.join(root, "vendor"))) ok.push("vendor");
+    else warnings.push({ tool: "composer", missing: "vendor", fix: "composer install", message: "composer.json present but vendor/ is missing — PHP dependencies are not installed." });
+  }
+  // python: a declared project but no virtualenv / installed packages
+  if (exists(path.join(root, "requirements.txt")) || exists(path.join(root, "pyproject.toml")) || exists(path.join(root, "Pipfile"))) {
+    const hasVenv = ["venv", ".venv", "env", ".env-venv"].some((d) => exists(path.join(root, d)));
+    if (!hasVenv) warnings.push({ tool: "python", missing: "virtualenv", fix: "python -m venv .venv && pip install -r requirements.txt (or `uv sync` / `poetry install`)", message: "Python project detected but no virtualenv (.venv/) found — dependencies may not be installed." });
+    else ok.push(".venv");
+  }
+  // git submodules declared but not checked out
+  const gm = readText(path.join(root, ".gitmodules"));
+  if (gm) {
+    for (const m of gm.matchAll(/^\s*path\s*=\s*(.+)$/gm)) {
+      const sp = m[1].trim();
+      if (dirEmpty(path.join(root, sp))) warnings.push({ tool: "git", missing: sp, fix: `git submodule update --init --recursive`, message: `Submodule '${sp}' is not initialized (empty) — its contents will look like missing references.` });
+      else ok.push(`submodule:${sp}`);
+    }
+  }
+  return { ok, warnings, clean: warnings.length === 0 };
+}
+
+// ---------------------------------------------------------------------------
 // Reporting + merge
 // ---------------------------------------------------------------------------
 const SEV_RANK = { broken: 0, stale: 1, warning: 2, outdated: 3 };
@@ -747,6 +820,15 @@ function main() {
     process.exit(0);
   }
 
+  // --preflight: just check that dependencies/submodules are installed and exit.
+  // Run this BEFORE the full validation so uninstalled deps don't cause spurious
+  // "missing reference" findings. Exits non-zero when there are warnings.
+  if (preflightOnly) {
+    const pf = checkPreflight(PROJECT_DIR);
+    process.stdout.write(JSON.stringify({ projectDir: PROJECT_DIR, preflight: pf }, null, 2) + "\n");
+    process.exit(pf.clean ? 0 : 1);
+  }
+
   const ctx = buildContext(PROJECT_DIR);
   ctx.gitLastMs = gitLastCommitMs(PROJECT_DIR);
   const baseline = changedOnly || writeBaseline ? readJSON(BASELINE_PATH) : null;
@@ -793,6 +875,7 @@ function main() {
   const output = {
     projectDir: PROJECT_DIR,
     scannedUser: includeUser,
+    preflight: checkPreflight(PROJECT_DIR),
     context: { hasPackageJson: !!ctx.npmScripts, hasComposer: !!ctx.composerScripts, hasMakefile: !!ctx.makeTargets, hasEnvoy: !!ctx.envoyTasks, hasEnvExample: !!ctx.envKeys },
     summary,
     findings,

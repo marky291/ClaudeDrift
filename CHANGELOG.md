@@ -3,6 +3,42 @@
 All notable changes to ClaudeDrift are documented here. This project follows
 [semantic versioning](https://semver.org/).
 
+## [0.4.0] — Rich-artifact validation + preflight
+
+Validated against real repositories with **populated `.claude/` surfaces** —
+agents, skills, and commands (2anki/server: 12 agents + 8 skills + 17 commands;
+basedosdados/pipelines; hashintel/hash) — not just CLAUDE.md. Each false positive
+became a general rule.
+
+### Added
+- **Preflight dependency check** (`--preflight`) — before validating, the skill
+  verifies dependencies/submodules are installed (`node_modules`, `vendor`, a
+  Python virtualenv, initialized submodules) and warns up front, because refs into
+  uninstalled packages otherwise look like drift. Surfaced in every run under
+  `preflight` and as a `Step 0` in the command.
+- **Nested-manifest awareness** — npm/composer scripts are unioned across *all*
+  `package.json`/`composer.json` files (monorepos/subprojects keep their own, e.g.
+  `web/package.json`), so a script defined in a subproject isn't reported missing.
+- **`file:line` citations** (`foo.ts:78`) have the line/col suffix stripped before
+  resolving — extremely common in agent docs.
+- **Confidence anchored to real top-level dirs** — a missing multi-segment path is
+  HIGH only if its first segment is an actual top-level dir; otherwise LOW (handles
+  monorepo crate-relative paths like `hashql-mir/src/...`). Root-level files stay HIGH.
+
+### Fixed
+- CLI flags captured as script names (`pnpm --filter web build` no longer reports
+  `--filter`); `yarn workspace` builtin excluded.
+- Build-output/generated dirs anywhere in a path (`web/build/…`, `dist/`, `target/`).
+- Truncated template refs (`docs/spec-`).
+- **Context bleed** — negative/creation keywords on an adjacent line no longer
+  suppress an unrelated reference (context window is now the current line only).
+
+### Results
+- ts2anki (37 artifacts): noise cut to a small set of high-confidence findings that
+  are genuine drift (`Documentation/specs`, `src/lib/Token.ts` cited across many
+  artifacts); remaining items are agent sample-output paths left for the semantic
+  pass. Regression suite grown to 35 cases.
+
 ## [0.3.0] — Cross-ecosystem precision
 
 Validated against real GitHub repositories shipping Claude artifacts across many
