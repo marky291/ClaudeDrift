@@ -221,6 +221,12 @@ function buildContext(root) {
   const gm = readText(path.join(root, ".gitmodules"));
   const submodulePaths = gm ? [...gm.matchAll(/^\s*path\s*=\s*(.+)$/gm)].map((m) => m[1].trim()) : [];
 
+  // Every file basename in the project — lets us recognise a ref that doesn't
+  // resolve at the written path but exists elsewhere (moved / cwd-relative), so
+  // it's downgraded rather than flagged as a confident missing reference.
+  const basenames = new Set();
+  try { for (const f of walk(root, () => true, 8)) basenames.add(path.basename(f)); } catch {}
+
   return {
     npmScripts: npmScriptsAll,
     composerScripts: composerScriptsAll,
@@ -232,6 +238,7 @@ function buildContext(root) {
     isIgnored: buildGitignoreMatcher(root),
     topDirs,
     submodulePaths,
+    basenames,
   };
 }
 
@@ -388,14 +395,19 @@ function classifyPath(cand, text, root, artifactPath, ctx, opts = {}) {
   if (before.includes("~") || raw.startsWith("~")) return { suppress: { ref, why: "external home path (~)" } };
   // PHP/namespace separator immediately before
   if (before.endsWith("\\")) return { suppress: { ref, why: "namespace (backslash)" } };
-  // token is the tail of a longer path/filename, e.g. "Herd.app/Contents/..."
-  if (/[A-Za-z0-9]\.$/.test(before)) return { suppress: { ref, why: "partial of a longer path" } };
+  // token is the tail of a longer path/filename, e.g. "Herd.app/Contents/..." — or a
+  // dotdir whose leading dot was split off by a preceding `/` ("/.claude/..." -> the
+  // regex starts at `claude`). Both mean we captured a fragment, not the real path.
+  if (/[A-Za-z0-9]\.$|\/\.$/.test(before)) return { suppress: { ref, why: "partial of a longer path" } };
   // leading ALL_CAPS_UNDERSCORE segment → a variable/placeholder (ROOT_REPO/, CURRENT_BRANCH/)
   if (PLACEHOLDER_VAR_SEG.test(ref)) return { suppress: { ref, why: "placeholder/variable segment" } };
   // instructional placeholder paths (path/to/..., your-thing/...)
   if (PLACEHOLDER_PATH.test(ref)) return { suppress: { ref, why: "instructional placeholder path" } };
   // example/placeholder class or file names
   if (EXAMPLE_NAME.test(ref)) return { suppress: { ref, why: "example/placeholder name" } };
+  // doc-template placeholder segments: NNN / XXX / YYYY (case-sensitive caps so we
+  // don't hit real words like "connection"), or `descriptive-title`-style slugs.
+  if (/(?:^|[/_-])(NNN+|XXX+|YYYY|ZZZ+)(?:[/_.-]|$)/.test(refRaw) || /\b(descriptive-title|your-title|your-name|example-name)\b/i.test(refRaw)) return { suppress: { ref, why: "doc-template placeholder" } };
   // incomplete/template ref left dangling on a separator (e.g. `docs/spec-` from `docs/spec-<id>`)
   if (/[-_]$/.test(ref)) return { suppress: { ref, why: "incomplete/template reference" } };
   // git submodule contents — legitimately absent until `git submodule update`
@@ -459,10 +471,20 @@ function classifyPath(cand, text, root, artifactPath, ctx, opts = {}) {
   // path inside a fenced sample block of an instructional artifact (agent/command).
   const exampleCtx = EXAMPLE_CONTEXT.test(ctxLine);
   const inSampleFence = opts.instructional && opts.fences && inRanges(opts.fences, idx);
-  if (anchored && !exampleCtx && !inSampleFence)
+  // Markdown table rows are descriptive (often prose like "prover/requestor addresses"
+  // or example columns), not authoritative file-existence claims → downgrade.
+  const inTableRow = (ctxLine.match(/\|/g) || []).length >= 2 && /\|.*[A-Za-z0-9].*\|/.test(ctxLine);
+  // A file with this basename exists elsewhere in the repo → the ref is most likely
+  // moved or written relative to another cwd, not genuinely missing. Downgrade.
+  const existsElsewhere = ctx.basenames && ctx.basenames.has(path.basename(ref));
+  if (anchored && !exampleCtx && !inSampleFence && !inTableRow && !existsElsewhere)
     return { emit: { ref, kind: "path", severity: "broken", confidence: "high", reason: "path not found on disk" } };
-  const reason = exampleCtx || inSampleFence
+  const reason = existsElsewhere
+    ? "path not found here, but a file with this name exists elsewhere in the repo (likely moved or cwd-relative)"
+    : exampleCtx || inSampleFence
     ? "path not found; appears in example/sample context — likely illustrative (needs semantic review)"
+    : inTableRow
+    ? "path not found; appears in a markdown table cell (often descriptive prose, not a file claim)"
     : "path not found; first segment is not a project top-level dir (may be relative to a subdir/crate)";
   return { emit: { ref, kind: "path", severity: "broken", confidence: "low", reason } };
 }
@@ -498,6 +520,7 @@ const CMD_PATTERNS = [
 
 function checkCommands(text, ctx) {
   const broken = [];
+  let resolved = 0; // command refs that DO exist — used for command-corroboration
   const ranges = codeRanges(text);
   for (const { re, kind, ctx: ctxKey, skip } of CMD_PATTERNS) {
     const known = ctx[ctxKey];
@@ -509,14 +532,14 @@ function checkCommands(text, ctx) {
       if (/^-/.test(m[1])) continue; // a CLI flag (e.g. `pnpm --filter web build`), not a script name
       const name = m[1].replace(/[-:]+$/, ""); // strip trailing punctuation contamination
       if (!name || (skip && skip(name))) continue;
-      if (known.includes(name)) continue;
+      if (known.includes(name)) { resolved++; continue; }
       // just recipes we can't resolve (modules/imports, or a `:` submodule name) → medium
       const confidence =
         ctxKey === "justRecipes" && (ctx.justHasModules || name.includes(":")) ? "medium" : "high";
       broken.push({ ref: name, kind, severity: "broken", confidence, reason: `not defined (${ctxKey})` });
     }
   }
-  return broken;
+  return { broken, resolved };
 }
 
 // ---------------------------------------------------------------------------
@@ -539,10 +562,16 @@ function checkConfigCommands(artifact, root) {
   const broken = [];
   if (!json) return broken;
   if (artifact.type === "hooks" || artifact.type === "settings") {
+    const RUNNERS = new Set(["bash", "sh", "zsh", "node", "python", "python3", "ruby", "deno", "bun", "pwsh", "powershell"]);
     for (const cmd of collectCommands(json, "command")) {
       const cleaned = cmd.replace(/\$\{CLAUDE_PROJECT_DIR\}/g, root).replace(/\$CLAUDE_PROJECT_DIR/g, root).trim();
-      if (cleaned.includes("${")) continue;
-      const tok = cleaned.split(/\s+/)[0];
+      if (cleaned.includes("${") || cleaned.includes("$(")) continue;
+      const parts = cleaned.split(/\s+/);
+      // skip a leading interpreter (`bash X`, `node Y`) to get at the script path
+      let tok = parts[0];
+      if (RUNNERS.has(path.basename(tok)) && parts[1]) tok = parts[1];
+      tok = tok.replace(/^["']+|["']+$/g, ""); // strip surrounding quotes (e.g. "$CLAUDE_PROJECT_DIR"/x)
+      if (tok.includes("$") || tok.includes('"')) continue; // unresolved var or embedded quote — skip
       if (tok && (tok.includes("/") || tok.startsWith(".")) && !exists(path.resolve(root, tok)) && !exists(tok)) {
         broken.push({ ref: tok, kind: "hook-command", severity: "broken", confidence: "high", reason: "hook command target not found" });
       }
@@ -659,7 +688,22 @@ function verifyArtifact(artifact, root, ctx, names, baseline) {
     }
   }
 
-  dedupBroken.push(...checkCommands(text, ctx));
+  // Command-corroboration (same idea as paths): if an artifact names commands but
+  // NONE of them exist in the project's manifests, it isn't describing THIS repo's
+  // commands — it's a generic/prescriptive agent (e.g. "run `make build`, `make
+  // test-unit`"). Downgrade those findings to low for the semantic pass.
+  const cmd = checkCommands(text, ctx);
+  const cmdTotal = cmd.resolved + cmd.broken.length;
+  // If most of an artifact's commands don't resolve (<1/3), it's a generic command
+  // checklist, not a description of THIS project — downgrade. A real typo among many
+  // working commands (high resolve ratio) stays high.
+  if (cmd.broken.length >= 2 && cmd.resolved / cmdTotal < 0.34) {
+    for (const b of cmd.broken) {
+      b.confidence = "low";
+      b.reason += " — most commands this artifact names don't exist in the project (generic/prescriptive; needs semantic review)";
+    }
+  }
+  dedupBroken.push(...cmd.broken);
   dedupBroken.push(...checkConfigCommands(artifact, root));
   if (artifact.type !== "settings" && artifact.type !== "mcp")
     dedupBroken.push(...checkCrossRefs(text, names.known, names.prefix, fm.name || path.basename(artifact.path, ".md")));

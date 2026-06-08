@@ -39,6 +39,11 @@ write("Envoy.blade.php", "@task('deploy') echo hi @endtask\n");
 // nested manifest (monorepo): a script defined only in a subproject's package.json
 write("web/package.json", JSON.stringify({ scripts: { "test:e2e": "playwright" } }));
 write("web/src/styles/shared.css", ".x{}\n"); // real file referenced as shared.css:78
+write("tools/helper.sh", "#!/bin/bash\n");     // basename exists here; referenced as ./helper.sh at root
+write(".claude/hooks/real-hook.sh", "#!/bin/bash\n"); // referenced via "$CLAUDE_PROJECT_DIR"/... (quoted)
+write(".claude/settings.json", JSON.stringify({
+  hooks: { PostToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: '"$CLAUDE_PROJECT_DIR"/.claude/hooks/real-hook.sh' }] }] },
+}));
 // cross-language: a real top-level dir with a non-PHP/JS name (no SRC_PREFIX match)
 write("crates/realcrate/lib.rs", "pub fn x() {}\n");
 // a declared git submodule path (its contents are legitimately absent here)
@@ -61,6 +66,16 @@ write(
 // the project uses .claude/ layout for the rest
 fs.cpSync(path.join(FX, "skills"), path.join(FX, ".claude", "skills"), { recursive: true });
 fs.rmSync(path.join(FX, "skills"), { recursive: true });
+
+// a generic/prescriptive agent: lists several commands, none of which exist in the
+// project's manifests -> all downgraded to low by command-corroboration.
+write(
+  ".claude/agents/generic-opt.md",
+  [
+    "---", "name: generic-opt", "description: d", "---",
+    "Standard setup: run `npm run alpha`, then `npm run beta`, then `npm run gamma`.",
+  ].join("\n")
+);
 
 // an agent with a real ref (so corroboration does NOT fire) plus a fenced sample
 // block whose path is illustrative — must be downgraded to LOW by the fence rule.
@@ -89,6 +104,9 @@ write(
     "- Use the proj-missing skill to do X.", // cross-ref to non-existent skill
     "- A crate lives at `crates/realcrate/missing.rs`.", // dynamic top-dir: crates/ real, file missing
     "- For example see `app/Models/Ghost.php`.", // example-context -> LOW (app is real top-dir, file missing)
+    "- New ADRs: copy template to `docs/adr/NNN-descriptive-title.md`.", // doc-template placeholder -> suppressed
+    "- Run the shared `./helper.sh` script.", // basename exists in tools/ -> LOW, not HIGH
+    "| Indexer | reads `app/TableGhost.php` for lifecycle |", // table cell -> LOW, not HIGH
     "",
     "## False positives (should be SUPPRESSED)",
     "- Submodule code at `modules/vendored/core.rs`.", // git submodule path (declared in .gitmodules)
@@ -161,6 +179,12 @@ const tests = [
   ["suppresses editor/IDE config", () => suppressedHas("IDE")],
   ["suppresses build output dir (web/build)", () => suppressedHas("build output")],
   ["suppresses truncated template ref (docs/spec-)", () => suppressedHas("template")],
+  ["suppresses doc-template NNN placeholder", () => suppressedHas("doc-template")],
+  ["does NOT flag quoted hook command (file exists)", () => notFlagged("real-hook.sh")],
+  ["basename-exists-elsewhere ref is LOW", () => {
+    const f = j.findings.find((x) => (x.ref || "").includes("helper.sh"));
+    return f && f.confidence === "low";
+  }],
   // nested-manifest, file:line, flag, crate-relative
   ["does NOT flag --filter as npm-script", () => notFlagged("filter")],
   ["does NOT flag test:e2e (defined in web/package.json)", () => !findingRefs.has("test:e2e")],
@@ -171,6 +195,14 @@ const tests = [
   }],
   ["example-context ref is LOW confidence", () => {
     const f = j.findings.find((x) => (x.ref || "").includes("app/Models/Ghost.php"));
+    return f && f.confidence === "low";
+  }],
+  ["table-cell ref is LOW confidence", () => {
+    const f = j.findings.find((x) => (x.ref || "").includes("app/TableGhost.php"));
+    return f && f.confidence === "low";
+  }],
+  ["generic command list (none resolve) is LOW", () => {
+    const f = j.findings.find((x) => x.ref === "alpha");
     return f && f.confidence === "low";
   }],
   ["agent fenced sample path is LOW confidence", () => {
