@@ -377,7 +377,7 @@ function* pathCandidates(text) {
     const inner = m[1].trim();
     const first = inner.split(/\s+/)[0];
     const raw = looksLikePath(first) ? first : looksLikePath(inner) ? inner : null;
-    if (raw) yield { raw, idx: m.index + 1, before: text.slice(Math.max(0, m.index - 1), m.index + 1), after: "`" };
+    if (raw) yield { raw, idx: m.index + 1, before: text.slice(Math.max(0, m.index - 1), m.index + 1), after: "`", backtick: true };
   }
   // bare tokens — capture trailing glob chars so we can detect (not truncate) globs
   for (const m of text.matchAll(/(?<![\w/])((?:\.\.?\/)?(?:[\w.-]+\/){1,}[\w.@*?{}-]+(?:\.[A-Za-z0-9]+)?)/g)) {
@@ -386,6 +386,7 @@ function* pathCandidates(text) {
       idx: m.index,
       before: text.slice(Math.max(0, m.index - 4), m.index),
       after: text[m.index + m[0].length] || "",
+      backtick: false, // bare (not in a code span) — weaker signal it's a real path
     };
   }
 }
@@ -432,11 +433,12 @@ const DOWNGRADE = [
   { reason: "path not found; appears in example/sample context — likely illustrative (needs semantic review)", test: (c) => c.exampleCtx || c.inSampleFence },
   { reason: "path not found; appears in a markdown table cell (often descriptive prose, not a file claim)", test: (c) => c.inTableRow },
   { reason: "path not found; appears in a list of alternative/candidate paths (not all are expected to exist)", test: (c) => c.altList },
+  { reason: "path not found; a bare (non-code-span) token inside a prose enumeration — likely a name, not a path", test: (c) => c.proseList },
   { reason: "path not found; first segment is not a project top-level dir (may be relative to a subdir/crate)", test: (c) => !c.anchored },
 ];
 
 function classifyPath(cand, text, root, artifactPath, ctx, opts = {}) {
-  const { raw, idx, before, after } = cand;
+  const { raw, idx, before, after, backtick } = cand;
   // strip a trailing file:line[:col] citation (common in agent docs: `foo.ts:78`)
   const ref = norm(raw.replace(GLOB_CHARS, "")).replace(/:\d+(?::\d+)?$/, "");
   const c = {
@@ -473,6 +475,11 @@ function classifyPath(cand, text, root, artifactPath, ctx, opts = {}) {
   c.inSampleFence = opts.instructional && opts.fences && inRanges(opts.fences, idx);
   c.inTableRow = (c.ctxLine.match(/\|/g) || []).length >= 2 && /\|.*[A-Za-z0-9].*\|/.test(c.ctxLine);
   c.altList = (c.ctxLine.match(/`[^`]*[./][^`]*`/g) || []).length >= 3;
+  // A BARE (non-backticked) ref inside a prose enumeration — a comma-list whose
+  // items are multi-word phrases ("packet routing, deploy/pulse, connection
+  // lifecycle") — is almost always a name, not a path. Backticked refs are exempt
+  // (the author deliberately marked them as code).
+  c.proseList = backtick === false && /,\s*[a-z]+\s+[a-z]+/i.test(c.ctxLine);
   c.existsElsewhere = ctx.basenames && ctx.basenames.has(path.basename(ref));
   const down = DOWNGRADE.find((d) => d.test(c));
   return down

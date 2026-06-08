@@ -4,8 +4,8 @@
 
 ### Your `CLAUDE.md`, skills, and agents rot as your code changes. ClaudeDrift finds out where — and fixes it.
 
-[![version](https://img.shields.io/badge/version-0.5.1-blue)](https://github.com/marky291/ClaudeDrift/releases)
-[![tests](https://img.shields.io/badge/tests-52%20passing-brightgreen)](./test/run.mjs)
+[![version](https://img.shields.io/badge/version-0.5.2-blue)](https://github.com/marky291/ClaudeDrift/releases)
+[![tests](https://img.shields.io/badge/tests-53%20passing-brightgreen)](./test/run.mjs)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-8A63D2)](https://code.claude.com/docs/en/plugins)
 [![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![zero deps](https://img.shields.io/badge/dependencies-0-blue)](./scripts/discover.mjs)
@@ -185,7 +185,7 @@ ClaudeDrift/
 ├── skills/drift-check/SKILL.md   # the /claude-drift:drift-check command
 ├── agents/drift-auditor.md       # per-artifact semantic (context-drift) auditor
 ├── scripts/discover.mjs          # deterministic scanner + preflight/merge/baseline/ci
-└── test/run.mjs                  # 52-case precision regression suite
+└── test/run.mjs                  # 53-case precision regression suite
 ```
 
 ## Roadmap
@@ -197,7 +197,7 @@ ClaudeDrift/
 ## Contributing
 
 ```bash
-npm test    # 52-case precision regression suite
+npm test    # 53-case precision regression suite
 ```
 
 Found a false positive in your ecosystem? Open an issue with the artifact snippet —

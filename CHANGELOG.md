@@ -3,6 +3,18 @@
 All notable changes to ClaudeDrift are documented here. This project follows
 [semantic versioning](https://semver.org/).
 
+## [0.5.2] — Prose-enumeration false positive
+
+Re-checked against marky291/ragnasync (now well-maintained, CLAUDE.md fully aligned
+per the semantic pass). The only deterministic false positive — a bare slash-token
+in a prose comma-list of subsystem names (`packet routing, deploy/pulse, …`) flagged
+because `deploy/` is a real dir — is fixed.
+
+### Added
+- **Backtick provenance + prose-enumeration downgrade** — a BARE (non-code-span)
+  ref inside a comma-list of multi-word phrases is downgraded to low; backticked
+  refs are exempt (recall-safe; guarded by the recall corpus). Suite 52 → 53.
+
 ## [0.5.1] — Recall corpus + scanner refactor (no behavior change)
 
 Hardening the precision work so it can't silently hide real drift.

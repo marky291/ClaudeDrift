@@ -42,6 +42,7 @@ write("web/package.json", JSON.stringify({ scripts: { "test:e2e": "playwright" }
 write("web/src/styles/shared.css", ".x{}\n"); // real file referenced as shared.css:78
 write("tools/helper.sh", "#!/bin/bash\n");     // basename exists here; referenced as ./helper.sh at root
 write("docs/real.md", "# docs\n");             // makes docs/ a real top-dir (for alt-list test)
+write("deploy/realmap.md", "# deploy\n");      // makes deploy/ a real top-dir (for prose-list test)
 write(".claude/hooks/real-hook.sh", "#!/bin/bash\n"); // referenced via "$CLAUDE_PROJECT_DIR"/... (quoted)
 write(".claude/settings.json", JSON.stringify({
   hooks: { PostToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: '"$CLAUDE_PROJECT_DIR"/.claude/hooks/real-hook.sh' }] }] },
@@ -127,6 +128,7 @@ write(
     "- Bugs go in `tests/bugs/bugN_short_name.txt`.", // doc-template placeholder -> suppressed
     "- Type-check via `pnpm tsc --noEmit`.", // tsc is a binary, not a script -> not flagged
     "- Architecture: `docs/ARCH.md`, `docs/architecture.md`, `docs/STRUCTURE.md`.", // alt-list -> LOW
+    "Subsystem maps: packet routing, deploy/widget, connection lifecycle, script engine.", // bare ref in prose enumeration -> LOW
     "",
     "## False positives (should be SUPPRESSED)",
     "- Submodule code at `modules/vendored/core.rs`.", // git submodule path (declared in .gitmodules)
@@ -206,6 +208,10 @@ const tests = [
   ["suppresses PascalCase placeholder ComponentName", () => notFlagged("ComponentName")],
   ["alt-list candidate path is LOW", () => {
     const f = j.findings.find((x) => (x.ref || "").includes("docs/ARCH.md"));
+    return f && f.confidence === "low";
+  }],
+  ["bare ref in prose enumeration is LOW", () => {
+    const f = j.findings.find((x) => (x.ref || "").includes("deploy/widget"));
     return f && f.confidence === "low";
   }],
   ["does NOT flag quoted hook command (file exists)", () => notFlagged("real-hook.sh")],
