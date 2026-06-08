@@ -2,13 +2,12 @@
 
 # 🧭 ClaudeDrift
 
-### Your `CLAUDE.md`, skills, and agents rot as your code changes. ClaudeDrift finds out where — and fixes it.
+### Your `CLAUDE.md`, skills, and agents rot as your code changes. ClaudeDrift reasons out where — and fixes it.
 
-[![version](https://img.shields.io/badge/version-0.5.2-blue)](https://github.com/marky291/ClaudeDrift/releases)
-[![tests](https://img.shields.io/badge/tests-53%20passing-brightgreen)](./test/run.mjs)
+[![version](https://img.shields.io/badge/version-0.6.0-blue)](https://github.com/marky291/ClaudeDrift/releases)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-8A63D2)](https://code.claude.com/docs/en/plugins)
+[![reasoning](https://img.shields.io/badge/engine-reasoning%2C%20not%20regex-brightgreen)](./agents)
 [![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
-[![zero deps](https://img.shields.io/badge/dependencies-0-blue)](./scripts/discover.mjs)
 
 ```
 /claude-drift:drift-check
@@ -33,25 +32,101 @@ context produces wrong work — quietly, every session.
 
 **ClaudeDrift is a Claude Code plugin that audits all of those artifacts against
 your actual codebase, shows you exactly where they've drifted, and offers to fix
-them.** Run it on demand. No setup, no config, zero dependencies.
+them.** Run it on demand.
 
 ## Two kinds of drift it catches
 
 | | |
 |---|---|
-| 🔗 **Reference drift** | A path, command, or script an artifact names no longer exists. Found instantly by a deterministic scanner. |
-| 🧠 **Context drift** | The *description* of your architecture, workflow, tech stack, or conventions no longer matches the code — **even when every file path still resolves** ("we use Redux" → you're on Zustand). Found by a semantic pass that actually reads your code. |
+| 🔗 **Reference drift** | A path, command, or script an artifact names no longer exists. |
+| 🧠 **Context drift** | The *description* of your architecture, workflow, tech stack, or conventions no longer matches the code — **even when every file path still resolves** ("we use Redux" → you're on Zustand). |
 
 Most tools can only do the first. The second is where the real damage hides.
 
-## Quickstart
+## Reasoning, not regex
+
+ClaudeDrift doesn't scan your docs with a pile of pattern-matching rules. It uses
+**Claude's own reasoning, via subagents**, to read each artifact alongside the code
+it describes and *judge* whether it's still true.
+
+That distinction matters. A regex can't tell:
+
+- a real path from an **illustrative example** (`e.g. \`src/Foo.tsx\``, a fenced
+  sample, a `your-component` placeholder);
+- a missing file from one **relative to a sub-package, crate, or dependency**
+  (`hashql-mir/src/...`, "files to modify in `eufy-security-client`");
+- a broken reference from a path the doc **creates as output** or documents as
+  *already removed*;
+- a path from **prose where a slash means "and"** (`prover/requestor`, `CUDA/Metal`);
+- a renamed command from a **generic "best-practices" template** that lists ideal
+  commands a project *should* have.
+
+This project started as a deterministic scanner. Validated across ~40 real repos,
+that scanner needed an endless stream of new rules for each of the cases above —
+and still got them wrong at the edges. The reasoning agents got every one right by
+*understanding* the artifact. So the scanner is gone; reasoning is the engine.
+
+## What it looks like
+
+> **A dangerous one, caught.** In a real TypeScript repo (2anki/server) ClaudeDrift
+> found `src/lib/Token.ts` referenced in the `HARD_BLOCK_PATHS` safety list of
+> **three** agents/commands — gating real "stop and use a worktree" logic — on a
+> file that no longer exists. The guard had quietly become a no-op. No grep would
+> have told you the *guard itself* was dead.
+
+> **A subtle one, caught.** A skill referenced its own file as `…/skill.md`
+> (lowercase). Works on the maintainer's Mac; **breaks the moment it runs in Linux
+> CI** (case-sensitive filesystem). Surfaced as a real, actionable finding.
+
+> **A false alarm, *not* raised.** `CLAUDE.md` mentioned "deploy/pulse" in a prose
+> list of subsystem names, and `deploy/` is a real directory. A scanner flags it.
+> ClaudeDrift read the sentence, saw it was a name and not a path, and stayed quiet.
+
+Then it offers to apply the fix and re-verifies it's gone.
+
+## How it works
+
+Three reasoning passes, orchestrated by the `/claude-drift:drift-check` command:
+
+1. **Map the Claude flow** — the **`claude-flow-mapper`** subagent discovers every
+   artifact (`CLAUDE.md`, skills, commands, agents, settings, hooks, `.mcp.json`),
+   reads enough of the codebase to understand the real stack/layout/workflow, notes
+   whether dependencies are installed, and ranks each artifact by how likely it has
+   drifted — so the deep audit is **prioritized, not 50 blind agents**.
+2. **Audit** — a **`drift-auditor`** subagent reasons about each artifact against the
+   real code (reference *and* context drift), returning evidenced findings with an
+   exact `old → new` fix. It judges, on the spot, what's a real claim vs an example,
+   a sub-package path, or prose.
+3. **Synthesize & apply** — the command merges and ranks the findings, shows you a
+   report grouped 🔴 Broken / 🟠 Stale / 🟡 Outdated with evidence, and offers to
+   apply the fixes (then re-verifies them).
+
+**Source of truth is your codebase.** When an artifact and the code disagree, the
+artifact is what's wrong — ClaudeDrift never edits your code.
+
+## What it audits
+
+- `CLAUDE.md` files (including nested ones)
+- `.claude/skills/*/SKILL.md`, `.claude/commands/**/*.md`, `.claude/agents/*.md`
+- `.claude/settings.json`, `settings.local.json`, hooks, `.mcp.json`
+- With `--user`: the same artifacts under `~/.claude`
+
+## Usage
+
+```
+/claude-drift:drift-check                # audit the current project
+/claude-drift:drift-check --user         # also audit ~/.claude artifacts
+/claude-drift:drift-check --changed      # only audit artifacts changed since last commit
+/claude-drift:drift-check --apply        # apply fixes without re-prompting
+/claude-drift:drift-check /path/to/proj  # audit a different project directory
+```
+
+## Install
+
+Try it locally:
 
 ```bash
-# Try it instantly against any project (no install)
 claude --plugin-dir /path/to/ClaudeDrift
-
-# then, inside Claude Code:
-/claude-drift:drift-check
 ```
 
 Or install it as a plugin:
@@ -61,147 +136,29 @@ Or install it as a plugin:
 /plugin install claude-drift
 ```
 
-That's it. Point it at any repo that uses Claude artifacts and run the command.
+> **Cost & footprint.** Nothing runs until you invoke the command — **no MCP server,
+> no always-on hooks**. When you do run it, it spends model tokens proportional to
+> your artifact count (one mapping pass plus a deep audit of the artifacts that
+> warrant it). For first/clean dependency state, run after `npm install` /
+> `composer install` so references resolve.
 
-> **Featherweight.** ClaudeDrift adds **~250 tokens** to a session — it's a single
-> on-demand command plus one auditor agent, with **no MCP server and no always-on
-> hooks**. The expensive semantic pass only runs when you ask it to. Install costs
-> you almost nothing until you use it.
-
-## What it looks like
-
-Run against a real production repo (a Laravel app with **13** Claude artifacts):
-
-```
-ClaudeDrift report — 2 findings across 13 artifacts (256 candidates analyzed)
-
-🔴 Broken (2)
-- .claude/skills/ragnasync-work-github-issues/SKILL.md
-  → `…/skill.md`  (confidence: medium)
-  case mismatch — resolves on macOS/Windows but BREAKS on case-sensitive
-  filesystems (Linux / CI). The skill references its own file in lowercase.
-```
-
-> **Real bug, caught.** That skill worked fine on the maintainer's Mac and would
-> have silently broken the moment it ran in Linux CI. ClaudeDrift analyzed **256**
-> reference candidates, correctly ignored **254** (globs, placeholders, generated
-> files, gitignored secrets, example paths…), and surfaced the **2** that mattered.
-
-Then it offers to apply the fix and re-verifies it's gone.
-
-> **A more dangerous one.** In a real TypeScript repo (2anki/server, 37 Claude
-> artifacts) ClaudeDrift flagged `src/lib/Token.ts` as missing — and it was. That
-> path sat in the `HARD_BLOCK_PATHS` safety list of **three** agents/commands,
-> gating real "stop and use a worktree" logic on a file that no longer exists. The
-> guard had quietly become a no-op. No grep would have told you the *guard itself*
-> was dead.
-
-## Why you can trust the findings
-
-False positives kill tools like this. ClaudeDrift is tuned for precision and was
-**validated against 30 real repositories across 8+ ecosystems** (PHP, Go, Python,
-C#, Ruby, Rust, TypeScript, Java) — monorepos, and repos with 30+ skills/agents/
-commands. **21 of 30 scanned completely clean**; the rest surfaced only genuine
-drift (confirmed by the semantic pass). Every false positive found became a general
-rule, not a hack:
-
-- **Language-agnostic:** a path "looks real" when its first segment is an actual
-  top-level directory of *your* project — no hardcoded `src`/`app` assumptions. Works
-  for Go (`internal/`), C# (`modules/`), Rust (`crates/`), any layout.
-- **Knows what to ignore:** globs, `<placeholders>`, `$SHELL_VARS`, `~/` and absolute
-  machine paths, example names (`FooService`), `file:line` citations, build output,
-  git-submodule paths, editor configs, and anything in your `.gitignore`.
-- **Reads context:** a file a doc says it *creates*, documents as *removed*, or shows
-  as *example output* (`e.g.`, fenced sample blocks in agents) is downgraded, not
-  flagged as real drift.
-- **Monorepo-aware:** scripts are checked across *all* `package.json`/`composer.json`
-  files; a path written relative to a sub-crate is low-confidence, not a false alarm.
-- **Corroboration rule:** a broken path is **high confidence** only if the artifact
-  also names a path that *does* resolve — proof it really describes *this* repo.
-
-Every finding carries a **confidence** level and **evidence**. Every ignored
-candidate is listed with a reason, so the tool is fully auditable.
-
-## Preflight: no false alarms from uninstalled deps
-
-Before validating, ClaudeDrift checks that your dependencies are actually installed
-— `node_modules`, `vendor/`, a Python virtualenv, initialized git submodules. If
-something's missing it tells you up front (with the fix command) rather than
-drowning you in "missing reference" findings that are really just *not installed
-yet*. One less way to get a misleading report.
-
-## What it audits
-
-- `CLAUDE.md` files (including nested ones)
-- `.claude/skills/*/SKILL.md`
-- `.claude/commands/**/*.md`
-- `.claude/agents/*.md`
-- `.claude/settings.json`, `settings.local.json`, hooks
-- `.mcp.json`
-- With `--user`: the same artifacts under `~/.claude`
-
-**Source of truth is your codebase.** When an artifact and the code disagree, the
-artifact is what's wrong — ClaudeDrift never edits your code.
-
-## Usage
-
-```
-/claude-drift:drift-check                # audit the current project
-/claude-drift:drift-check --user         # also audit ~/.claude artifacts
-/claude-drift:drift-check --changed-only # only re-audit what changed since baseline
-/claude-drift:drift-check --apply        # apply fixes without re-prompting
-/claude-drift:drift-check --ci           # non-interactive: write report, no apply
-```
-
-The bundled scanner also runs standalone (and in CI):
-
-```bash
-node scripts/discover.mjs <projectDir> --preflight         # check deps are installed first
-node scripts/discover.mjs <projectDir> --report drift.md   # markdown report
-node scripts/discover.mjs <projectDir> --baseline          # snapshot for --changed-only
-node scripts/discover.mjs <projectDir> --ci --fail-on broken # exit non-zero on drift
-```
-
-See a full sample report in [`docs/example-drift-report.md`](./docs/example-drift-report.md).
-
-## How it works
-
-0. **Preflight** — confirm dependencies/submodules are installed so uninstalled
-   packages don't masquerade as drift.
-1. **`scripts/discover.mjs`** (Node, **zero dependencies**) enumerates every
-   artifact and hard-verifies the concrete references inside them against the live
-   filesystem and package manifests, applying the precision rules above. Node is
-   always present — Claude Code itself runs on it.
-2. **`drift-auditor`** subagents read each *changed* artifact alongside the code it
-   describes and judge **context drift**, proposing grounded edits with evidence —
-   even on artifacts with zero broken references, because that's where context
-   drift hides.
-3. **`/claude-drift:drift-check`** orchestrates both passes, merges and de-dupes the
-   findings deterministically, produces a severity-ranked report, applies accepted
-   fixes, and re-verifies them.
+## Layout
 
 ```
 ClaudeDrift/
-├── skills/drift-check/SKILL.md   # the /claude-drift:drift-check command
-├── agents/drift-auditor.md       # per-artifact semantic (context-drift) auditor
-├── scripts/discover.mjs          # deterministic scanner + preflight/merge/baseline/ci
-└── test/run.mjs                  # 53-case precision regression suite
+├── skills/drift-check/SKILL.md        # the /claude-drift:drift-check command (orchestrator)
+├── agents/claude-flow-mapper.md       # maps the project's Claude flow + prioritizes
+└── agents/drift-auditor.md            # reasons about one artifact vs the real code
 ```
+
+Pure prompt-engineered Claude Code components — no runtime, no dependencies, no
+deterministic scanner.
 
 ## Roadmap
 
 - Passive nudges (SessionStart / PreToolUse hooks) — warn the moment you act on a drifted artifact
-- GitHub Action for drift checks on every PR
-- Auto-extend precision rules per detected ecosystem
-
-## Contributing
-
-```bash
-npm test    # 53-case precision regression suite
-```
-
-Found a false positive in your ecosystem? Open an issue with the artifact snippet —
-that's exactly how the rule set grows. PRs welcome.
+- A cheap "map-only" mode for quick health checks
+- Drift reports committed to the repo for review-time diffing
 
 ## License
 

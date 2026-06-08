@@ -1,7 +1,7 @@
 ---
 name: drift-check
-description: Audit this project's Claude artifacts (CLAUDE.md, skills, commands, agents, hooks/settings, .mcp.json) for drift from the project's actual current reality — both broken references AND context drift (stale architecture/workflow/convention descriptions) — then produce a ranked report and offer to apply fixes.
-argument-hint: "[--user] [--apply] [--changed-only] [--ci] [path]"
+description: Audit this project's Claude artifacts (CLAUDE.md, skills, commands, agents, hooks/settings, .mcp.json) for drift from the project's actual reality — both broken references AND context drift (stale architecture/workflow/convention descriptions) — using Claude's reasoning via subagents, then produce a ranked report and offer to apply fixes.
+argument-hint: "[--user] [--apply] [--changed] [path]"
 user-invocable: true
 disable-model-invocation: true
 allowed-tools: "Bash Read Edit Glob Grep Task"
@@ -10,125 +10,89 @@ allowed-tools: "Bash Read Edit Glob Grep Task"
 # ClaudeDrift — drift check
 
 Audit every Claude artifact that steers this project and report where it has
-**drifted from the project's actual reality**. The reality / source of truth is
-the codebase you are invoked from. Two kinds of drift matter equally:
+**drifted from the project's actual reality**. The source of truth is the codebase
+you are invoked from. This is done by **reasoning, not by a deterministic script** —
+Claude reads the artifacts and the real code and judges drift, via subagents.
 
-- **Reference drift** — a path/command/script the artifact names no longer exists.
+Two kinds of drift matter equally:
+- **Reference drift** — a path/command/script an artifact names no longer exists.
 - **Context drift** — the artifact's *description* of the architecture, workflow,
-  tech stack, or conventions no longer matches the code, **even when every file
-  path still resolves**. This is the harder, higher-value class and is found by
-  the semantic pass, not the script.
+  tech stack, or conventions no longer matches the code, even when every path still
+  resolves. This is the harder, higher-value class.
 
 Arguments (`$ARGUMENTS`):
-- `--user` — also scan `~/.claude` artifacts (separate, lower-confidence section).
-- `--changed-only` — only audit artifacts changed since the last baseline (cheap re-runs).
+- `--user` — also audit `~/.claude` artifacts (separate, clearly-marked section).
+- `--changed` — only audit artifacts changed since the last commit (`git diff`),
+  for cheap re-runs.
 - `--apply` — apply accepted fixes without a second prompt.
-- `--ci` — non-interactive: write the report and stop (no apply).
 - a path — audit a different project directory instead of `$CLAUDE_PROJECT_DIR`.
 
-## Step 0 — Preflight: are dependencies installed?
+The target project dir is `$ARGUMENTS`'s path, else `$CLAUDE_PROJECT_DIR`, else the
+current working directory.
 
-Before validating, check that the project's dependencies and submodules are
-installed — otherwise references *into* uninstalled packages show up as false
-"missing reference" drift.
+## Step 1 — Map the Claude flow
 
-```
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/discover.mjs" "${CLAUDE_PROJECT_DIR:-$PWD}" --preflight 2>/dev/null`
-```
+Spawn the **`claude-flow-mapper`** subagent (Task tool, `subagent_type:
+"claude-flow-mapper"`) on the project dir (pass `--user` if given). It returns the
+artifact inventory, a `projectReality` grounding summary, install-state caveats,
+and a `driftLikelihood` rating per artifact.
 
-Read the `preflight` object. If `clean` is true, proceed silently. If it has
-`warnings` (e.g. `node_modules`/`vendor` missing, an uninitialized submodule),
-**surface them to the user first** and note that some findings may be false
-positives until those are installed. Offer to run the suggested `fix` command
-(e.g. `npm install`, `composer install`, `git submodule update --init`) before
-continuing — but do not run installs without the user's go-ahead. The user may
-choose to proceed anyway; that's fine, just keep the caveat in the final report.
+If it finds no Claude artifacts, say so and stop. If `installState` has caveats
+(deps not installed, submodule uninitialized), surface them first — note that
+findings may include false positives until installed, and offer to run the install
+(don't run it without the user's go-ahead).
 
-## Step 1 — Deterministic discovery + hard checks
+If `--changed` was passed, intersect the inventory with `git -C <dir> diff --name-only`
+(and untracked) to keep only artifacts that changed.
 
-```
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/discover.mjs" "${CLAUDE_PROJECT_DIR:-$PWD}" $ARGUMENTS 2>/dev/null`
-```
+## Step 2 — Deep audit (fan out, reasoned, prioritized)
 
-(The full run also includes the same `preflight` object, so re-surface any
-warnings in the report header if the user proceeded without installing.)
+Spawn a **`drift-auditor`** subagent per artifact (Task tool, in parallel — one
+message, multiple Task calls), passing `artifactPath`, `projectDir`, and the
+`projectReality` summary from Step 1.
 
-Parse the JSON. Key fields:
-- `artifacts[]` — each with `rel`, `type`, `brokenRefs` (already-verified reference
-  drift, with `confidence`), `suppressed` (candidates deliberately ignored, with
-  reasons — do not re-report these), `needsSemanticPass`, `recencyStaleDays`.
-- `summary.artifactsNeedingSemanticPass` — the list to fan out in Step 2.
-- `findings[]` — the flattened, ranked reference-drift findings.
+Prioritize and budget — don't blindly spawn dozens:
+- Always audit artifacts rated `high`/`medium` drift-likelihood.
+- Audit `low`/`none` too, but in later batches; cap concurrency to ~8 at a time.
+- On a large surface (say >15 artifacts), audit the high/medium set first, report,
+  and tell the user how many low/none remain and offer to continue.
 
-If JSON has an `error`, report it and stop. If `artifactCount` is 0, say no
-Claude artifacts were found and stop.
+Each auditor reasons about the artifact against the real code and returns findings
+(reference + context drift) with evidence and an exact `old → new` edit.
 
-## Step 2 — Semantic / context-drift pass (fan out)
+## Step 3 — Synthesize the report (by reasoning)
 
-For **every artifact in `summary.artifactsNeedingSemanticPass`** (NOT only the
-ones with broken refs — context drift usually has zero broken refs), spawn a
-**`drift-auditor`** subagent via the Task tool (`subagent_type: "drift-auditor"`),
-in parallel (one message, multiple Task calls). Give each:
-- `artifactPath`, `projectDir`,
-- `hardFindings`: that artifact's `brokenRefs` (so it folds in / rejects them).
+Collect every auditor's findings and reason over them yourself — merge duplicates,
+drop anything an auditor already judged a false positive, and rank by severity and
+confidence. Group:
+- 🔴 **Broken** — a reference resolves to nothing.
+- 🟠 **Stale** — context drift: the description contradicts the current code.
+- 🟡 **Outdated / low-confidence** — likely stale, weaker evidence.
 
-Each auditor reads the artifact against the real code and returns findings JSON
-focused on context drift (stale architecture/workflow/tech/convention claims)
-plus confirmed reference drift, each with evidence and an exact `old → new` edit.
-
-Collect every auditor's JSON into an array and write it to a temp file, e.g.
-`/tmp/claudedrift-auditor.json`.
-
-## Step 3 — Merge into one ranked report (deterministic)
-
-Let the script merge + de-duplicate the hard findings and the auditor findings,
-so you don't have to reconcile them by hand:
-
-```
-node "${CLAUDE_PLUGIN_ROOT}/scripts/discover.mjs" "<projectDir>" --merge /tmp/claudedrift-auditor.json --report .claude/drift-report.md
-```
-
-Present the merged `findings`, grouped by severity:
-- 🔴 **Broken** — reference resolves to nothing.
-- 🟠 **Stale** — context drift: description contradicts current code.
-- 🟡 **Warning / Outdated** — lower-confidence or recency-only.
-
-For each: the artifact (`rel` path), claim, reality, evidence (`file:line`), and
-the proposed edit. Keep project-scope and `--user` scope in separate sections.
-End with the per-severity counts. If `findings` is empty, report
-"✅ No significant drift detected" and stop. The full report is saved to
+For each finding show: the artifact (relative path), the claim, the reality, the
+evidence (`file:line`), and the proposed edit. Keep project-scope and `--user`
+scope in separate sections. End with per-severity counts; if there are no findings,
+report "✅ No significant drift detected." Optionally write the report to
 `.claude/drift-report.md`.
 
 ## Step 4 — Offer to apply fixes
 
-(Skip this step entirely if `--ci` was passed.)
+List the findings that carry a concrete `suggestedEdit`. If `--apply` was given,
+apply them; otherwise ask which to apply (all / by number / none).
 
-List the findings that carry a concrete `suggestedEdit` (`old → new`). If
-`--apply` was passed, apply them directly; otherwise ask which to apply
-(all / by number / none).
-
-To apply: use **Edit** on the artifact with `old_string = suggestedEdit.old`,
-`new_string = suggestedEdit.new`. Apply one at a time. If `old_string` is not an
-exact unique match, skip it and flag for manual fixing — never apply a fuzzy
-edit, and never apply a finding with no `suggestedEdit`.
-
-**Verify after applying:** re-run Step 1 (optionally `--changed-only`) on the
-edited artifacts and confirm the resolved findings no longer appear. Report what
-changed and what still needs manual attention.
-
-## Step 5 — Offer to update the baseline
-
-Offer to record the current state as the baseline so future runs can use
-`--changed-only`:
-
-```
-node "${CLAUDE_PLUGIN_ROOT}/scripts/discover.mjs" "<projectDir>" --baseline
-```
+To apply: re-read the artifact, then use **Edit** with `old_string =
+suggestedEdit.old`, `new_string = suggestedEdit.new`. Apply one at a time; if the
+`old_string` isn't an exact unique match (e.g. a prior edit shifted things), skip
+it and flag for manual fixing — never apply a fuzzy edit, never apply a finding
+with no `suggestedEdit`. After applying, briefly re-verify the edited artifacts
+(re-read, or re-spawn an auditor on them) and report what changed and what still
+needs manual attention.
 
 ## Principles
 
-- The codebase is the source of truth — when an artifact and the code disagree,
-  the **artifact** is wrong and gets fixed. Never edit code to match an artifact.
-- Context drift is the point: an artifact with no broken paths can still be badly
-  out of date. Always run the semantic pass on changed artifacts.
-- Be conservative — only report evidenced drift; never re-report `suppressed` items.
+- The codebase is the source of truth — fix the **artifact**, never the code.
+- Reason, don't pattern-match: an illustrative example, a subdir/dependency-relative
+  path, a created-output path, or prose where a slash means "A and B" is NOT drift.
+  This judgment is the whole point of using subagents instead of a script.
+- Context drift is the headline: an artifact with zero broken paths can still be
+  badly out of date. Always have the auditor read the code, not just check paths.

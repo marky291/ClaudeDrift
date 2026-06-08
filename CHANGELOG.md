@@ -3,6 +3,34 @@
 All notable changes to ClaudeDrift are documented here. This project follows
 [semantic versioning](https://semver.org/).
 
+## [0.6.0] — Reasoning engine (deterministic scanner removed)
+
+**Architecture change.** ClaudeDrift no longer uses a deterministic script to find
+drift. Validated across ~40 real repos, the regex/heuristic scanner was an endless
+catch-up — every new repo surfaced a false-positive class needing another rule —
+while the reasoning subagents judged every ambiguous case correctly (example vs
+real path, sub-package/dependency paths, prose-where-slash-means-and, generic
+templates). So the engine is now **Claude's reasoning, via subagents**.
+
+### Changed
+- **`claude-flow-mapper` agent (new)** — determines the project's "Claude flow":
+  discovers every artifact, reads the codebase to understand the real
+  stack/layout/workflow, notes dependency-install state, and ranks each artifact by
+  drift-likelihood so the deep audit is prioritized (not N blind agents).
+- **`drift-auditor` agent (rewritten)** — reasons about one artifact vs the real
+  code from scratch (reference + context drift); no script-fed hints. Judges
+  examples / sub-package paths / created-output / prose itself.
+- **`drift-check` skill (rewritten)** — orchestrates map → audit → synthesize →
+  apply purely with subagents and reasoning. Args simplified to
+  `--user` / `--changed` / `--apply` / `path`.
+
+### Removed
+- `scripts/discover.mjs` (the ~1000-line deterministic scanner and all its precision
+  rules), `test/run.mjs` (its 53-case suite), and `package.json` (the test runner).
+- Script-only modes: `--ci` / `--baseline` / `--preflight` / `--report` /
+  `--merge` / `--changed-only`. (Install-state is now reported by the flow-mapper;
+  `--changed` uses `git diff`.)
+
 ## [0.5.2] — Prose-enumeration false positive
 
 Re-checked against marky291/ragnasync (now well-maintained, CLAUDE.md fully aligned
