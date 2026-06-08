@@ -320,6 +320,17 @@ const EXAMPLE_NAME = /(?:^|\/)(?:Foo|Bar|Baz|Qux|Example|Sample|Dummy|Placeholde
 const EXAMPLE_PASCAL = /(?:^|\/)(?:My[A-Z]|Your[A-Z]|Some[A-Z]|ComponentName|FileName|ClassName|ModuleName|ServiceName)[A-Za-z0-9]*(?:\.|\/|$)/;
 // Runtime-generated / ephemeral paths that are legitimately absent on a fresh clone.
 const EPHEMERAL = /^(?:bootstrap\/cache|storage\/(?:framework|logs|app)|public\/(?:hot|build|storage)|coverage)\//;
+// `before` ends with "<alnum>." (tail of a longer filename, "Herd.app/…") or "/." (a
+// dotdir whose leading dot was split off by a preceding slash, "/.claude/…").
+const PARTIAL_BEFORE = /[A-Za-z0-9]\.$|\/\.$/;
+// Doc-template placeholders: NNN/XXX/YYYY number stubs (case-sensitive so "connection"
+// is safe) and `descriptive-title` / `short_name` / `bugN`-style slugs.
+const DOC_TEMPLATE_SEG = /(?:^|[/_-])(NNN+|XXX+|YYYY|ZZZ+)(?:[/_.-]|$)/;
+const DOC_TEMPLATE_WORD = /(?:descriptive-title|short[_-]name|file[_-]name|some[_-]name|the[_-]name|your[_-](?:title|name)|example[_-]name|bug[N](?:_|\.|\/|$)|step[N](?:_|\.|\/|$))/i;
+const IDE_CONFIG = /^\.(vscode|idea|fleet|zed|vs)\//;
+const BUILD_OUTPUT = /(?:^|\/)(?:build|dist|out|target|coverage|node_modules|\.next|\.nuxt)\//;
+const RUNTIME_CLAUDE = /^\.?(?:claude|cursor)\/(?:checkpoints|state|cache|tmp|temp|logs|runs|sessions|history|memory|scratch|artifacts|output)\b/;
+const ENV_CONFIG = /(?:^|\/)\.env\.(?!example|sample|template|dist|defaults?)[\w.-]+$/i;
 
 const norm = (s) => s.replace(/[),.;:]+$/, "").replace(/\/$/, "");
 const looksLikePath = (s) =>
@@ -379,127 +390,94 @@ function* pathCandidates(text) {
   }
 }
 
+// --- Path classification rules (declarative & ordered) -----------------------
+// Each suppress rule: { why, test(c) }. `c` is the classification context built in
+// classifyPath. Order matters and mirrors the original sequential checks. Keeping
+// them as a named, ordered table makes every rule individually testable and the
+// precedence explicit. RAW rules run on the raw token before we confirm it's a
+// path; EARLY rules run after; LATE rules run after on-disk resolution.
+
+const RAW_SUPPRESS = [
+  { why: "glob/pattern", test: (c) => GLOB_CHARS.test(c.refRaw) || GLOB_CHARS.test(c.after) },
+  { why: "placeholder", test: (c) => PLACEHOLDER.test(c.refRaw) },
+];
+const EARLY_SUPPRESS = [
+  { why: "shell/env variable", test: (c) => c.before.endsWith("$") },
+  { why: "external home path (~)", test: (c) => c.before.includes("~") || c.raw.startsWith("~") },
+  { why: "namespace (backslash)", test: (c) => c.before.endsWith("\\") },
+  { why: "partial of a longer path", test: (c) => PARTIAL_BEFORE.test(c.before) },
+  { why: "placeholder/variable segment", test: (c) => PLACEHOLDER_VAR_SEG.test(c.ref) },
+  { why: "instructional placeholder path", test: (c) => PLACEHOLDER_PATH.test(c.ref) },
+  { why: "example/placeholder name", test: (c) => EXAMPLE_NAME.test(c.ref) || EXAMPLE_PASCAL.test(c.ref) },
+  { why: "doc-template placeholder", test: (c) => DOC_TEMPLATE_SEG.test(c.refRaw) || DOC_TEMPLATE_WORD.test(c.refRaw) },
+  { why: "incomplete/template reference", test: (c) => /[-_]$/.test(c.ref) },
+  { why: "git submodule path (may be uninitialized)", test: (c) => c.submodulePaths.some((s) => c.refClean === s || c.refClean.startsWith(s + "/")) },
+  { why: "editor/IDE config (often local-only)", test: (c) => IDE_CONFIG.test(c.refClean) },
+];
+const LATE_SUPPRESS = [
+  { why: "not clearly a project file", test: (c) => !c.looksReal },
+  { why: "gitignored (intentionally absent)", test: (c) => c.ctx.isIgnored && c.ctx.isIgnored(c.ref.replace(/^\/+/, "")) },
+  { why: "runtime-generated/ephemeral path", test: (c) => EPHEMERAL.test(c.ref) },
+  { why: "build output / generated dir", test: (c) => BUILD_OUTPUT.test(c.ref) },
+  { why: "runtime/output dir under .claude", test: (c) => RUNTIME_CLAUDE.test(c.refClean) },
+  { why: "env config file (environment-specific/local)", test: (c) => ENV_CONFIG.test(c.ref) },
+  { why: "documented as removed/moved (negative context)", test: (c) => NEGATIVE.test(c.ctxLine) },
+  { why: "described as created (output path)", test: (c) => CREATION.test(c.ctxLine) },
+  { why: "namespace-like (matching class exists)", test: (c) => !c.ext && namespaceLike(c.ref, c.root) },
+];
+// Downgrade signals (high → low). First match supplies the reason; if none match
+// and the ref is anchored to the project root, it stays high confidence.
+const DOWNGRADE = [
+  { reason: "path not found here, but a file with this name exists elsewhere in the repo (likely moved or cwd-relative)", test: (c) => c.existsElsewhere },
+  { reason: "path not found; appears in example/sample context — likely illustrative (needs semantic review)", test: (c) => c.exampleCtx || c.inSampleFence },
+  { reason: "path not found; appears in a markdown table cell (often descriptive prose, not a file claim)", test: (c) => c.inTableRow },
+  { reason: "path not found; appears in a list of alternative/candidate paths (not all are expected to exist)", test: (c) => c.altList },
+  { reason: "path not found; first segment is not a project top-level dir (may be relative to a subdir/crate)", test: (c) => !c.anchored },
+];
+
 function classifyPath(cand, text, root, artifactPath, ctx, opts = {}) {
   const { raw, idx, before, after } = cand;
-  const refRaw = raw;
   // strip a trailing file:line[:col] citation (common in agent docs: `foo.ts:78`)
   const ref = norm(raw.replace(GLOB_CHARS, "")).replace(/:\d+(?::\d+)?$/, "");
-  const topDirs = ctx?.topDirs || new Set();
-  const submodulePaths = ctx?.submodulePaths || [];
+  const c = {
+    raw, refRaw: raw, ref, refClean: ref.replace(/^\.\//, ""), before, after, idx, ctx, root,
+    topDirs: ctx?.topDirs || new Set(), submodulePaths: ctx?.submodulePaths || [],
+  };
 
-  // glob / pattern — never a single concrete file
-  if (GLOB_CHARS.test(refRaw) || GLOB_CHARS.test(after)) return { suppress: { ref: refRaw, why: "glob/pattern" } };
-  // placeholder tokens
-  if (PLACEHOLDER.test(refRaw)) return { suppress: { ref: refRaw, why: "placeholder" } };
+  for (const r of RAW_SUPPRESS) if (r.test(c)) return { suppress: { ref: c.refRaw, why: r.why } };
   if (!looksLikePath(ref)) return null;
-  // shell / env variable reference, e.g. "$ROOT_REPO/..." (the `$` was dropped by the lookbehind)
-  if (before.endsWith("$")) return { suppress: { ref, why: "shell/env variable" } };
-  // external / home paths (the `~/` was stripped by the lookbehind — detect via `before`)
-  if (before.includes("~") || raw.startsWith("~")) return { suppress: { ref, why: "external home path (~)" } };
-  // PHP/namespace separator immediately before
-  if (before.endsWith("\\")) return { suppress: { ref, why: "namespace (backslash)" } };
-  // token is the tail of a longer path/filename, e.g. "Herd.app/Contents/..." — or a
-  // dotdir whose leading dot was split off by a preceding `/` ("/.claude/..." -> the
-  // regex starts at `claude`). Both mean we captured a fragment, not the real path.
-  if (/[A-Za-z0-9]\.$|\/\.$/.test(before)) return { suppress: { ref, why: "partial of a longer path" } };
-  // leading ALL_CAPS_UNDERSCORE segment → a variable/placeholder (ROOT_REPO/, CURRENT_BRANCH/)
-  if (PLACEHOLDER_VAR_SEG.test(ref)) return { suppress: { ref, why: "placeholder/variable segment" } };
-  // instructional placeholder paths (path/to/..., your-thing/...)
-  if (PLACEHOLDER_PATH.test(ref)) return { suppress: { ref, why: "instructional placeholder path" } };
-  // example/placeholder class or file names
-  if (EXAMPLE_NAME.test(ref) || EXAMPLE_PASCAL.test(ref)) return { suppress: { ref, why: "example/placeholder name" } };
-  // doc-template placeholder segments: NNN / XXX / YYYY (case-sensitive caps so we
-  // don't hit real words like "connection"), or `descriptive-title`-style slugs.
-  if (/(?:^|[/_-])(NNN+|XXX+|YYYY|ZZZ+)(?:[/_.-]|$)/.test(refRaw) || /(?:descriptive-title|short[_-]name|file[_-]name|some[_-]name|the[_-]name|your[_-](?:title|name)|example[_-]name|bug[N](?:_|\.|\/|$)|step[N](?:_|\.|\/|$))/i.test(refRaw)) return { suppress: { ref, why: "doc-template placeholder" } };
-  // incomplete/template ref left dangling on a separator (e.g. `docs/spec-` from `docs/spec-<id>`)
-  if (/[-_]$/.test(ref)) return { suppress: { ref, why: "incomplete/template reference" } };
-  // git submodule contents — legitimately absent until `git submodule update`
-  const refClean = ref.replace(/^\.\//, "");
-  if (submodulePaths.some((s) => refClean === s || refClean.startsWith(s + "/"))) return { suppress: { ref, why: "git submodule path (may be uninitialized)" } };
-  // editor / IDE config — usually local-only / git-ignored
-  if (/^\.(vscode|idea|fleet|zed|vs)\//.test(refClean)) return { suppress: { ref, why: "editor/IDE config (often local-only)" } };
+  for (const r of EARLY_SUPPRESS) if (r.test(c)) return { suppress: { ref, why: r.why } };
 
   // Resolve against project root, the artifact's dir, and (for leading-slash refs
   // written as repo-relative) the root with the slash stripped.
   const candidates = [path.resolve(root, ref), path.resolve(path.dirname(artifactPath), ref)];
   if (ref.startsWith("/")) candidates.push(path.resolve(root, ref.replace(/^\/+/, "")));
-  const foundAbs = candidates.find((c) => exists(c)) || null;
+  const foundAbs = candidates.find((p) => exists(p)) || null;
   if (foundAbs) {
     if (caseSensitiveExists(foundAbs)) return { ok: true }; // genuinely fine (counts as a resolving ref)
-    return {
-      emit: {
-        ref, kind: "path", severity: "broken", confidence: "medium",
-        reason: "case mismatch — resolves on macOS/Windows but breaks on case-sensitive filesystems (Linux/CI)",
-      },
-    };
+    return { emit: { ref, kind: "path", severity: "broken", confidence: "medium", reason: "case mismatch — resolves on macOS/Windows but breaks on case-sensitive filesystems (Linux/CI)" } };
   }
 
-  const ext = path.extname(ref).toLowerCase();
-  // Language-agnostic: a ref "looks like a project file" if it has a known code
-  // extension OR its first segment is a real top-level directory of THIS project
-  // (Go internal/, C# modules/, Rust crates/, …) — not just the PHP/JS allowlist.
-  const firstSeg = refClean.split("/")[0];
-  const looksReal = CODE_EXT.has(ext) || topDirs.has(firstSeg) || SRC_PREFIX.test(ref);
-  if (!looksReal) return { suppress: { ref, why: "not clearly a project file" } };
+  // Language-agnostic "looks like a project file": known code extension OR first
+  // segment is a real top-level dir (Go internal/, C# modules/, Rust crates/, …).
+  c.ext = path.extname(ref).toLowerCase();
+  c.firstSeg = c.refClean.split("/")[0];
+  c.looksReal = CODE_EXT.has(c.ext) || c.topDirs.has(c.firstSeg) || SRC_PREFIX.test(ref);
+  c.ctxLine = contextWindow(text, idx);
+  for (const r of LATE_SUPPRESS) if (r.test(c)) return { suppress: { ref, why: r.why } };
 
-  // gitignored → intentionally absent (secrets, local settings, build output, caches)
-  if (ctx.isIgnored && ctx.isIgnored(ref.replace(/^\/+/, ""))) return { suppress: { ref, why: "gitignored (intentionally absent)" } };
-
-  // runtime-generated / ephemeral — legitimately absent on a fresh clone
-  if (EPHEMERAL.test(ref)) return { suppress: { ref, why: "runtime-generated/ephemeral path" } };
-  // build output / generated directory anywhere in the path (web/build/, dist/, target/)
-  if (/(?:^|\/)(?:build|dist|out|target|coverage|node_modules|\.next|\.nuxt)\//.test(ref)) return { suppress: { ref, why: "build output / generated dir" } };
-  // runtime state dirs agents create under .claude / .cursor (checkpoints, logs, …)
-  if (/^\.?(?:claude|cursor)\/(?:checkpoints|state|cache|tmp|temp|logs|runs|sessions|history|memory|scratch|artifacts|output)\b/.test(refClean)) return { suppress: { ref, why: "runtime/output dir under .claude" } };
-  // environment config files (.env.local, .env.override.*) — environment-specific /
-  // local, conventionally gitignored. Keep committed .env.example/.sample/.template.
-  if (/(?:^|\/)\.env\.(?!example|sample|template|dist|defaults?)[\w.-]+$/i.test(ref)) return { suppress: { ref, why: "env config file (environment-specific/local)" } };
-
-  const ctxLine = contextWindow(text, idx);
-  // negative context — the doc is *describing* the absence, not asserting presence
-  if (NEGATIVE.test(ctxLine)) return { suppress: { ref, why: "documented as removed/moved (negative context)" } };
-  // creation context — the doc describes a file it CREATES (an output), not a reference
-  if (CREATION.test(ctxLine)) return { suppress: { ref, why: "described as created (output path)" } };
-
-  // namespace-like: no extension, PascalCase tail, sibling .php files exist
-  if (!ext && namespaceLike(ref, root)) return { suppress: { ref, why: "namespace-like (matching class exists)" } };
-
-  // High confidence only if the ref is anchored to a REAL project top-level dir.
-  // SRC_PREFIX is a guess (it lets `routes/x` look real even with no routes/ dir),
-  // so it must NOT raise confidence — only an actual top-level dir match does.
-  // Otherwise the ref is likely written relative to a subdir/crate/package we can't
-  // see (monorepo `hashql-mir/src/...` → really `libs/@local/hashql/mir/...`), so
-  // downgrade to low and let the semantic pass adjudicate.
-  // A single-segment ref (e.g. `./run.sh`, `Makefile`) is a root-level file —
-  // anchored to the project root. A multi-segment ref is anchored only if its
-  // first segment is a real top-level directory.
-  const anchored = refClean.split("/").length === 1 || topDirs.has(firstSeg);
-
-  // Illustrative context downgrades to low: an example line ("e.g. `x`"), or a
-  // path inside a fenced sample block of an instructional artifact (agent/command).
-  const exampleCtx = EXAMPLE_CONTEXT.test(ctxLine);
-  const inSampleFence = opts.instructional && opts.fences && inRanges(opts.fences, idx);
-  // Markdown table rows are descriptive (often prose like "prover/requestor addresses"
-  // or example columns), not authoritative file-existence claims → downgrade.
-  const inTableRow = (ctxLine.match(/\|/g) || []).length >= 2 && /\|.*[A-Za-z0-9].*\|/.test(ctxLine);
-  // A line listing 3+ backtick file/path tokens is an alternatives/candidate list
-  // ("docs are at `a.md`, `b.md`, or `c.md`"), not an assertion that all exist.
-  const altList = (ctxLine.match(/`[^`]*[./][^`]*`/g) || []).length >= 3;
-  // A file with this basename exists elsewhere in the repo → the ref is most likely
-  // moved or written relative to another cwd, not genuinely missing. Downgrade.
-  const existsElsewhere = ctx.basenames && ctx.basenames.has(path.basename(ref));
-  if (anchored && !exampleCtx && !inSampleFence && !inTableRow && !altList && !existsElsewhere)
-    return { emit: { ref, kind: "path", severity: "broken", confidence: "high", reason: "path not found on disk" } };
-  const reason = existsElsewhere
-    ? "path not found here, but a file with this name exists elsewhere in the repo (likely moved or cwd-relative)"
-    : exampleCtx || inSampleFence
-    ? "path not found; appears in example/sample context — likely illustrative (needs semantic review)"
-    : inTableRow
-    ? "path not found; appears in a markdown table cell (often descriptive prose, not a file claim)"
-    : altList
-    ? "path not found; appears in a list of alternative/candidate paths (not all are expected to exist)"
-    : "path not found; first segment is not a project top-level dir (may be relative to a subdir/crate)";
-  return { emit: { ref, kind: "path", severity: "broken", confidence: "low", reason } };
+  // Confidence: high only if anchored to a REAL top-level dir (or a root-level file)
+  // AND no downgrade signal fires. SRC_PREFIX is a guess so it never raises confidence.
+  c.anchored = c.refClean.split("/").length === 1 || c.topDirs.has(c.firstSeg);
+  c.exampleCtx = EXAMPLE_CONTEXT.test(c.ctxLine);
+  c.inSampleFence = opts.instructional && opts.fences && inRanges(opts.fences, idx);
+  c.inTableRow = (c.ctxLine.match(/\|/g) || []).length >= 2 && /\|.*[A-Za-z0-9].*\|/.test(c.ctxLine);
+  c.altList = (c.ctxLine.match(/`[^`]*[./][^`]*`/g) || []).length >= 3;
+  c.existsElsewhere = ctx.basenames && ctx.basenames.has(path.basename(ref));
+  const down = DOWNGRADE.find((d) => d.test(c));
+  return down
+    ? { emit: { ref, kind: "path", severity: "broken", confidence: "low", reason: down.reason } }
+    : { emit: { ref, kind: "path", severity: "broken", confidence: "high", reason: "path not found on disk" } };
 }
 
 function namespaceLike(ref, root) {

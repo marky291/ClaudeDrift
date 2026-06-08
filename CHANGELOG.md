@@ -3,6 +3,24 @@
 All notable changes to ClaudeDrift are documented here. This project follows
 [semantic versioning](https://semver.org/).
 
+## [0.5.1] — Recall corpus + scanner refactor (no behavior change)
+
+Hardening the precision work so it can't silently hide real drift.
+
+### Added
+- **Recall corpus** — regression tests asserting confirmed real-drift classes (a
+  missing path referenced in prose, a renamed make/npm target in an artifact whose
+  other commands resolve, a surfaced case-mismatch) *stay* high-confidence. Until
+  now every test measured precision (are HIGH findings real?); these guard recall
+  (are we over-suppressing?). Suite: 47 → 52 cases.
+
+### Changed
+- **`classifyPath` refactored** from a 120-line sequential `if`-gauntlet into a
+  declarative, ordered rule pipeline (`RAW_SUPPRESS` / `EARLY_SUPPRESS` /
+  `LATE_SUPPRESS` / `DOWNGRADE` tables). Each precision rule is now named and
+  individually testable; precedence is explicit. Inline regexes extracted to named
+  constants. Behavior is unchanged — all 52 tests pass identically.
+
 ## [0.5.0] — 30-source validation sweep
 
 Ran the full plugin flow (preflight + dependency install + discover + semantic

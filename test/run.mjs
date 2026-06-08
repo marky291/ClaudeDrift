@@ -36,6 +36,7 @@ write("bootstrap/cache/.gitkeep", "");
 write("package.json", JSON.stringify({ scripts: { build: "tsc" } }));
 write("composer.json", JSON.stringify({ scripts: { test: "phpunit" } }));
 write("Envoy.blade.php", "@task('deploy') echo hi @endtask\n");
+write("Makefile", "build:\n\techo b\ntest:\n\techo t\n"); // real make targets build, test (not publish)
 // nested manifest (monorepo): a script defined only in a subproject's package.json
 write("web/package.json", JSON.stringify({ scripts: { "test:e2e": "playwright" } }));
 write("web/src/styles/shared.css", ".x{}\n"); // real file referenced as shared.css:78
@@ -67,6 +68,18 @@ write(
 // the project uses .claude/ layout for the rest
 fs.cpSync(path.join(FX, "skills"), path.join(FX, ".claude", "skills"), { recursive: true });
 fs.rmSync(path.join(FX, "skills"), { recursive: true });
+
+// RECALL CORPUS — confirmed real-drift classes (from the 30-repo sweep) that must
+// STAY high/surfaced, so precision rules can't silently hide genuine drift.
+write(
+  ".claude/skills/recall-real/SKILL.md",
+  [
+    "---", "name: recall-real", "description: d", "---",
+    "The entry is `src/Real.ts`. See also `src/RealGone.ts` for the handler.", // missing, prose, corroborated -> HIGH
+    "Build with `make build` and `make test`, then `make publish`.", // publish missing, others resolve -> HIGH
+    "Run `npm run build`, then `npm run release`.", // release missing, build resolves -> HIGH
+  ].join("\n")
+);
 
 // a generic/prescriptive agent: lists several commands, none of which exist in the
 // project's manifests -> all downgraded to low by command-corroboration.
@@ -237,6 +250,24 @@ const tests = [
   // preflight: deps not installed should be flagged before validation
   ["preflight warns missing node_modules", () => (j.preflight?.warnings || []).some((w) => w.missing === "node_modules")],
   ["preflight warns uninitialized submodule", () => (j.preflight?.warnings || []).some((w) => w.tool === "git")],
+  // --- RECALL: confirmed real drift MUST stay high/surfaced (guards over-suppression) ---
+  ["RECALL: missing path in prose (corroborated) stays HIGH", () => {
+    const f = j.findings.find((x) => (x.ref || "").includes("src/RealGone.ts"));
+    return f && f.confidence === "high";
+  }],
+  ["RECALL: renamed make target (others resolve) stays HIGH", () => {
+    const f = j.findings.find((x) => x.ref === "publish" && x.kind === "make-target");
+    return f && f.confidence === "high";
+  }],
+  ["RECALL: renamed npm script (others resolve) stays HIGH", () => {
+    const f = j.findings.find((x) => x.ref === "release" && x.kind === "npm-script");
+    return f && f.confidence === "high";
+  }],
+  ["RECALL: real root script (./run.sh-style) surfaced", () => findingHas("src/main.ts")],
+  ["RECALL: case-mismatch is surfaced (not suppressed)", () => {
+    const f = j.findings.find((x) => (x.ref || "").includes("src/real.ts"));
+    return f && (f.confidence === "high" || f.confidence === "medium");
+  }],
   // corroboration: grounded artifact keeps HIGH; ungrounded template drops to LOW
   ["corroborated broken ref is HIGH confidence", () => confidenceOf("src/main.ts") === "high"],
   ["template artifact (no resolving paths) is LOW", () => {
