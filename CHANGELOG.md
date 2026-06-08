@@ -3,6 +3,43 @@
 All notable changes to ClaudeDrift are documented here. This project follows
 [semantic versioning](https://semver.org/).
 
+## [0.5.0] — 30-source validation sweep
+
+Ran the full plugin flow (preflight + dependency install + discover + semantic
+auditor) against **30 real repositories** across 8+ languages, installing deps so
+references resolve accurately. Each new false-positive class became a general rule;
+the semantic auditor confirmed surviving high-confidence findings are real drift
+(e.g. 2anki's `src/lib/Token.ts` in three agents' `HARD_BLOCK_PATHS` safety lists).
+Result: **21/30 repos clean**, remaining high-confidence findings are genuine drift
+or cases that by design require the semantic pass (illustrative examples in fenced
+skill snippets, cross-repo dependency references).
+
+### Added
+- **Preflight dependency check** surfaced and used during validation; deps are
+  installed (`--ignore-scripts`) before scanning so uninstalled packages don't read
+  as drift.
+- **Command-corroboration** — if fewer than a third of an artifact's commands exist
+  in the project, it's a generic/prescriptive checklist (e.g. an "optimizer" agent
+  listing `make build`/`make test-unit`) → downgrade. mcp-skillset 14→2 high.
+- **Markdown table cells** and **alternative/candidate path lists** (`a`, `b`, or
+  `c`) downgraded — descriptive, not file-existence claims.
+- **Basename-exists-elsewhere** downgrade for moved / cwd-relative refs.
+- New suppressions: runtime dirs under `.claude/` (`checkpoints`, `logs`, …), env
+  config files (`.env.override.local`), doc-template placeholders (`NNN`,
+  `short_name`, `bugN`), PascalCase example names (`ComponentName`, `MyComponent`).
+
+### Fixed
+- Hook commands with quotes / interpreter prefix (`"$CLAUDE_PROJECT_DIR"/x.sh`,
+  `bash x.sh`) now resolve; dotdir fragments (`/.claude/...`) no longer mis-captured.
+- `file:line` citations stripped before resolving; tool binaries (`pnpm tsc`,
+  `eslint`, `vitest`) no longer reported as missing scripts.
+- Context bleed: example/creation keywords no longer cross line boundaries.
+- Confidence anchored to real top-level dirs (crate-relative paths → low).
+
+### Coverage
+- Regression suite grown to **47 cases**, each derived from a real false/true
+  positive observed across the 30 repos.
+
 ## [0.4.1] — Example/sample-output precision
 
 Continued rich-artifact validation surfaced one more false-positive class:

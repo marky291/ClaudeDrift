@@ -298,7 +298,7 @@ const NEGATIVE =
   /\b(no longer|does\s*n[o']?t\s+exist|doesn'?t exist|don'?t use|do not use|has been (removed|renamed|moved|replaced|deleted)|was (removed|renamed|moved|replaced|deleted)|(now )?(moved|renamed|relocated|replaced) (to|by|with)|instead of|deprecated|removed in|formerly|used to (be|live)|previously|example only|placeholder|e\.g\.,? |there (is|are|'?s) no|no\s+\w+\s+(directory|folder|file)|must be initialized|not committed|git-?ignored)\b/i;
 // The artifact is describing a file it CREATES (an output), not one it references.
 const CREATION =
-  /\b(creat(e|es|ed|ing)|generat(e|es|ed|ing)|writ(e|es|ten|ing)\b|output(s|ted)?|produc(e|es|ed)|scaffold(s|ed)?|stub(s|bed)?|new file|save(d|s)? (to|as)|stored? (in|at))\b/i;
+  /\b(creat(e|es|ed|ing)|generat(e|es|ed|ing)|writ(e|es|ten|ing)\b|output(s|ted)?|produc(e|es|ed)|scaffold(s|ed)?|stub(s|bed)?|new file|save(d|s)? (to|as|under|in|at)|save(d|s)?\s+\w+\s+(under|in|to|at)|stored? (in|at|under)|document(ed|s|ing)? (in|at|to)|record(ed|s|ing)? (in|at|to)|log(ged|s|ging)? (in|to|at)|report(ed|s|ing)? (in|to|at)|append(ed|s|ing)? to|persist(ed|s|ing)? (in|to)|feedback (in|to)|note (in|to))\b/i;
 // Illustrative/example context — the path is a sample, not an assertion the file
 // exists. Downgrades confidence (keeps the finding for the semantic pass).
 // Note: no leading \b — these markers often sit next to `*`/`(` (e.g. `**Example**:`,
@@ -315,6 +315,9 @@ const CODE_EXT = new Set([
 const SRC_PREFIX = /^(src|lib|app|test|tests|scripts|packages|cmd|internal|config|resources|routes|database|bootstrap)\//;
 // Common placeholder / example class & file names — not real references.
 const EXAMPLE_NAME = /(?:^|\/)(?:Foo|Bar|Baz|Qux|Example|Sample|Dummy|Placeholder|Acme|MyClass|YourClass|SomeClass|File\d+|example[-_.]|sample[-_.]|your[-_]|some[-_]|test_file)[A-Za-z0-9]*(?:\.|\/|$)/i;
+// Case-SENSITIVE PascalCase placeholders (MyComponent, ComponentName) — must not be
+// /i or it would swallow real lowercase names like "mysql/" or "somelib/".
+const EXAMPLE_PASCAL = /(?:^|\/)(?:My[A-Z]|Your[A-Z]|Some[A-Z]|ComponentName|FileName|ClassName|ModuleName|ServiceName)[A-Za-z0-9]*(?:\.|\/|$)/;
 // Runtime-generated / ephemeral paths that are legitimately absent on a fresh clone.
 const EPHEMERAL = /^(?:bootstrap\/cache|storage\/(?:framework|logs|app)|public\/(?:hot|build|storage)|coverage)\//;
 
@@ -404,10 +407,10 @@ function classifyPath(cand, text, root, artifactPath, ctx, opts = {}) {
   // instructional placeholder paths (path/to/..., your-thing/...)
   if (PLACEHOLDER_PATH.test(ref)) return { suppress: { ref, why: "instructional placeholder path" } };
   // example/placeholder class or file names
-  if (EXAMPLE_NAME.test(ref)) return { suppress: { ref, why: "example/placeholder name" } };
+  if (EXAMPLE_NAME.test(ref) || EXAMPLE_PASCAL.test(ref)) return { suppress: { ref, why: "example/placeholder name" } };
   // doc-template placeholder segments: NNN / XXX / YYYY (case-sensitive caps so we
   // don't hit real words like "connection"), or `descriptive-title`-style slugs.
-  if (/(?:^|[/_-])(NNN+|XXX+|YYYY|ZZZ+)(?:[/_.-]|$)/.test(refRaw) || /\b(descriptive-title|your-title|your-name|example-name)\b/i.test(refRaw)) return { suppress: { ref, why: "doc-template placeholder" } };
+  if (/(?:^|[/_-])(NNN+|XXX+|YYYY|ZZZ+)(?:[/_.-]|$)/.test(refRaw) || /(?:descriptive-title|short[_-]name|file[_-]name|some[_-]name|the[_-]name|your[_-](?:title|name)|example[_-]name|bug[N](?:_|\.|\/|$)|step[N](?:_|\.|\/|$))/i.test(refRaw)) return { suppress: { ref, why: "doc-template placeholder" } };
   // incomplete/template ref left dangling on a separator (e.g. `docs/spec-` from `docs/spec-<id>`)
   if (/[-_]$/.test(ref)) return { suppress: { ref, why: "incomplete/template reference" } };
   // git submodule contents — legitimately absent until `git submodule update`
@@ -446,6 +449,11 @@ function classifyPath(cand, text, root, artifactPath, ctx, opts = {}) {
   if (EPHEMERAL.test(ref)) return { suppress: { ref, why: "runtime-generated/ephemeral path" } };
   // build output / generated directory anywhere in the path (web/build/, dist/, target/)
   if (/(?:^|\/)(?:build|dist|out|target|coverage|node_modules|\.next|\.nuxt)\//.test(ref)) return { suppress: { ref, why: "build output / generated dir" } };
+  // runtime state dirs agents create under .claude / .cursor (checkpoints, logs, …)
+  if (/^\.?(?:claude|cursor)\/(?:checkpoints|state|cache|tmp|temp|logs|runs|sessions|history|memory|scratch|artifacts|output)\b/.test(refClean)) return { suppress: { ref, why: "runtime/output dir under .claude" } };
+  // environment config files (.env.local, .env.override.*) — environment-specific /
+  // local, conventionally gitignored. Keep committed .env.example/.sample/.template.
+  if (/(?:^|\/)\.env\.(?!example|sample|template|dist|defaults?)[\w.-]+$/i.test(ref)) return { suppress: { ref, why: "env config file (environment-specific/local)" } };
 
   const ctxLine = contextWindow(text, idx);
   // negative context — the doc is *describing* the absence, not asserting presence
@@ -474,10 +482,13 @@ function classifyPath(cand, text, root, artifactPath, ctx, opts = {}) {
   // Markdown table rows are descriptive (often prose like "prover/requestor addresses"
   // or example columns), not authoritative file-existence claims → downgrade.
   const inTableRow = (ctxLine.match(/\|/g) || []).length >= 2 && /\|.*[A-Za-z0-9].*\|/.test(ctxLine);
+  // A line listing 3+ backtick file/path tokens is an alternatives/candidate list
+  // ("docs are at `a.md`, `b.md`, or `c.md`"), not an assertion that all exist.
+  const altList = (ctxLine.match(/`[^`]*[./][^`]*`/g) || []).length >= 3;
   // A file with this basename exists elsewhere in the repo → the ref is most likely
   // moved or written relative to another cwd, not genuinely missing. Downgrade.
   const existsElsewhere = ctx.basenames && ctx.basenames.has(path.basename(ref));
-  if (anchored && !exampleCtx && !inSampleFence && !inTableRow && !existsElsewhere)
+  if (anchored && !exampleCtx && !inSampleFence && !inTableRow && !altList && !existsElsewhere)
     return { emit: { ref, kind: "path", severity: "broken", confidence: "high", reason: "path not found on disk" } };
   const reason = existsElsewhere
     ? "path not found here, but a file with this name exists elsewhere in the repo (likely moved or cwd-relative)"
@@ -485,6 +496,8 @@ function classifyPath(cand, text, root, artifactPath, ctx, opts = {}) {
     ? "path not found; appears in example/sample context — likely illustrative (needs semantic review)"
     : inTableRow
     ? "path not found; appears in a markdown table cell (often descriptive prose, not a file claim)"
+    : altList
+    ? "path not found; appears in a list of alternative/candidate paths (not all are expected to exist)"
     : "path not found; first segment is not a project top-level dir (may be relative to a subdir/crate)";
   return { emit: { ref, kind: "path", severity: "broken", confidence: "low", reason } };
 }
@@ -510,8 +523,17 @@ const COMPOSER_BUILTINS = new Set([
   "clearcache", "cc", "config", "diagnose", "fund", "init", "licenses", "prohibits",
   "reinstall", "search", "status", "suggests", "depends", "bump", "browse", "home",
 ]);
+// Tool binaries commonly invoked via `pnpm <bin>` / `yarn <bin>` — these run the
+// node_modules/.bin executable, not a package.json script, so a missing "script"
+// of this name is a false positive.
+const JS_BINARIES = new Set([
+  "tsc", "eslint", "prettier", "biome", "vitest", "jest", "mocha", "vite", "tsx",
+  "tsup", "rollup", "webpack", "esbuild", "playwright", "cypress", "nodemon",
+  "turbo", "nx", "tsdown", "rimraf", "concurrently", "npm-run-all", "changeset",
+  "semantic-release", "husky", "lint-staged", "depcheck", "knip", "madge",
+]);
 const CMD_PATTERNS = [
-  { re: /\b(?:npm run|pnpm run|pnpm|yarn(?: run)?|bun run)\s+([A-Za-z0-9:_-]+)/g, kind: "npm-script", ctx: "npmScripts", skip: (n) => NPM_BUILTINS.has(n) },
+  { re: /\b(?:npm run|pnpm run|pnpm|yarn(?: run)?|bun run)\s+([A-Za-z0-9:_-]+)/g, kind: "npm-script", ctx: "npmScripts", skip: (n) => NPM_BUILTINS.has(n) || JS_BINARIES.has(n) },
   { re: /\bcomposer(?:\s+run(?:-script)?)?\s+([A-Za-z0-9:_-]+)/g, kind: "composer-script", ctx: "composerScripts", skip: (n) => COMPOSER_BUILTINS.has(n) },
   { re: /\bmake\s+([A-Za-z0-9:_-]+)/g, kind: "make-target", ctx: "makeTargets" },
   { re: /\benvoy\s+run\s+([A-Za-z0-9:_-]+)/g, kind: "envoy-task", ctx: "envoyTasks" },

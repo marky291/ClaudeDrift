@@ -40,6 +40,7 @@ write("Envoy.blade.php", "@task('deploy') echo hi @endtask\n");
 write("web/package.json", JSON.stringify({ scripts: { "test:e2e": "playwright" } }));
 write("web/src/styles/shared.css", ".x{}\n"); // real file referenced as shared.css:78
 write("tools/helper.sh", "#!/bin/bash\n");     // basename exists here; referenced as ./helper.sh at root
+write("docs/real.md", "# docs\n");             // makes docs/ a real top-dir (for alt-list test)
 write(".claude/hooks/real-hook.sh", "#!/bin/bash\n"); // referenced via "$CLAUDE_PROJECT_DIR"/... (quoted)
 write(".claude/settings.json", JSON.stringify({
   hooks: { PostToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: '"$CLAUDE_PROJECT_DIR"/.claude/hooks/real-hook.sh' }] }] },
@@ -107,6 +108,12 @@ write(
     "- New ADRs: copy template to `docs/adr/NNN-descriptive-title.md`.", // doc-template placeholder -> suppressed
     "- Run the shared `./helper.sh` script.", // basename exists in tools/ -> LOW, not HIGH
     "| Indexer | reads `app/TableGhost.php` for lifecycle |", // table cell -> LOW, not HIGH
+    "- Reviews saved in `.claude/checkpoints/code-reviews/`.", // runtime dir under .claude -> suppressed
+    "- Local env in `config/.env.override.local`.", // env config file -> suppressed
+    "- Style the `ComponentName.scss` file.", // PascalCase placeholder -> suppressed
+    "- Bugs go in `tests/bugs/bugN_short_name.txt`.", // doc-template placeholder -> suppressed
+    "- Type-check via `pnpm tsc --noEmit`.", // tsc is a binary, not a script -> not flagged
+    "- Architecture: `docs/ARCH.md`, `docs/architecture.md`, `docs/STRUCTURE.md`.", // alt-list -> LOW
     "",
     "## False positives (should be SUPPRESSED)",
     "- Submodule code at `modules/vendored/core.rs`.", // git submodule path (declared in .gitmodules)
@@ -180,6 +187,14 @@ const tests = [
   ["suppresses build output dir (web/build)", () => suppressedHas("build output")],
   ["suppresses truncated template ref (docs/spec-)", () => suppressedHas("template")],
   ["suppresses doc-template NNN placeholder", () => suppressedHas("doc-template")],
+  ["suppresses runtime dir under .claude", () => suppressedHas("runtime/output dir")],
+  ["suppresses env config file (.env.override.local)", () => suppressedHas("env config")],
+  ["does NOT flag binary `pnpm tsc`", () => notFlagged("tsc")],
+  ["suppresses PascalCase placeholder ComponentName", () => notFlagged("ComponentName")],
+  ["alt-list candidate path is LOW", () => {
+    const f = j.findings.find((x) => (x.ref || "").includes("docs/ARCH.md"));
+    return f && f.confidence === "low";
+  }],
   ["does NOT flag quoted hook command (file exists)", () => notFlagged("real-hook.sh")],
   ["basename-exists-elsewhere ref is LOW", () => {
     const f = j.findings.find((x) => (x.ref || "").includes("helper.sh"));

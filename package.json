@@ -1,6 +1,6 @@
 {
   "name": "claude-drift",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "private": true,
   "description": "Detect and fix drift between a project's Claude artifacts and its actual codebase.",
   "type": "module",

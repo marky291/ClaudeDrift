@@ -4,8 +4,8 @@
 
 ### Your `CLAUDE.md`, skills, and agents rot as your code changes. ClaudeDrift finds out where — and fixes it.
 
-[![version](https://img.shields.io/badge/version-0.4.1-blue)](https://github.com/marky291/ClaudeDrift/releases)
-[![tests](https://img.shields.io/badge/tests-37%20passing-brightgreen)](./test/run.mjs)
+[![version](https://img.shields.io/badge/version-0.5.0-blue)](https://github.com/marky291/ClaudeDrift/releases)
+[![tests](https://img.shields.io/badge/tests-47%20passing-brightgreen)](./test/run.mjs)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-8A63D2)](https://code.claude.com/docs/en/plugins)
 [![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![zero deps](https://img.shields.io/badge/dependencies-0-blue)](./scripts/discover.mjs)
@@ -99,9 +99,11 @@ Then it offers to apply the fix and re-verifies it's gone.
 ## Why you can trust the findings
 
 False positives kill tools like this. ClaudeDrift is tuned for precision and was
-**validated against 8 real repos across 7 ecosystems** (PHP, Go, Python, C#, Ruby,
-Rust, TypeScript) — including monorepos and repos with 30+ skills/agents/commands.
-Every false positive found became a general rule, not a hack:
+**validated against 30 real repositories across 8+ ecosystems** (PHP, Go, Python,
+C#, Ruby, Rust, TypeScript, Java) — monorepos, and repos with 30+ skills/agents/
+commands. **21 of 30 scanned completely clean**; the rest surfaced only genuine
+drift (confirmed by the semantic pass). Every false positive found became a general
+rule, not a hack:
 
 - **Language-agnostic:** a path "looks real" when its first segment is an actual
   top-level directory of *your* project — no hardcoded `src`/`app` assumptions. Works
@@ -183,7 +185,7 @@ ClaudeDrift/
 ├── skills/drift-check/SKILL.md   # the /claude-drift:drift-check command
 ├── agents/drift-auditor.md       # per-artifact semantic (context-drift) auditor
 ├── scripts/discover.mjs          # deterministic scanner + preflight/merge/baseline/ci
-└── test/run.mjs                  # 37-case precision regression suite
+└── test/run.mjs                  # 47-case precision regression suite
 ```
 
 ## Roadmap
@@ -195,7 +197,7 @@ ClaudeDrift/
 ## Contributing
 
 ```bash
-npm test    # 37-case precision regression suite
+npm test    # 47-case precision regression suite
 ```
 
 Found a false positive in your ecosystem? Open an issue with the artifact snippet —
