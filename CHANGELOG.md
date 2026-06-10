@@ -3,6 +3,37 @@
 All notable changes to ClaudeDrift are documented here. This project follows
 [semantic versioning](https://semver.org/).
 
+## [0.7.0] — Legacy narration (forward-looking drift)
+
+**New drift class.** ClaudeDrift now catches a third kind of drift: **legacy
+narration** (forward-looking drift). An artifact can be perfectly accurate — every
+path resolves, every description matches the code — yet still carry superseded-history
+framing a steering doc shouldn't ("Use Laravel Sail (previously Herd)", "X replaced
+Y", "Updated &lt;date&gt;: this section previously…"). It makes Claude read the
+migration story to act on the present, and risks acting on the dead thing. The fix
+states today's reality only.
+
+The value is the *keep/strip judgment*, which is why it runs through the reasoning
+agent, not a regex: provenance refs (bug/PR/date), genuine removal-guards (rephrased
+forward, never deleted), "instead of" comparisons, and true historical records
+(CHANGELOGs, ADRs, release notes) are deliberately left alone.
+
+### Added
+- **Legacy-narration detection** in `drift-auditor` — a third drift kind with its own
+  `legacy` severity and the explicit keep-vs-strip rules; a `legacy` fix strips a
+  history clause or rephrases to present tense, and must preserve any operational
+  guard the history wraps.
+- **`--forward-only` mode** in `drift-check` — a focused forward-looking pass that
+  spotlights only the ⚪ Legacy narration band (reference/context findings suppressed).
+- **⚪ Legacy narration** report band (always listed last, softest severity).
+- **Legacy-narration weighting** in `claude-flow-mapper` triage, so a path-accurate
+  but history-heavy artifact isn't rated `none`; record-role artifacts are exempted.
+
+### Changed
+- README, plugin/marketplace descriptions, and the example report updated to describe
+  three drift classes (the example report also corrected — it still credited the
+  deterministic scanner removed in 0.6.0).
+
 ## [0.6.0] — Reasoning engine (deterministic scanner removed)
 
 **Architecture change.** ClaudeDrift no longer uses a deterministic script to find

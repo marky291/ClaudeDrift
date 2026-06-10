@@ -11,8 +11,8 @@
     {
       "name": "claude-drift",
       "source": "./",
-      "description": "Detects and fixes drift between a project's Claude artifacts and its actual current reality.",
-      "version": "0.6.0"
+      "description": "Detects and fixes drift between a project's Claude artifacts and its actual current reality: broken references, stale context, and legacy-narration framing that should read forward-looking.",
+      "version": "0.7.0"
     }
   ]
 }

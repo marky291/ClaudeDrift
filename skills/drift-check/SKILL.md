@@ -14,16 +14,26 @@ Audit every Claude artifact that steers this project and report where it has
 you are invoked from. This is done by **reasoning, not by a deterministic script** —
 Claude reads the artifacts and the real code and judges drift, via subagents.
 
-Two kinds of drift matter equally:
+Three kinds of drift matter:
 - **Reference drift** — a path/command/script an artifact names no longer exists.
 - **Context drift** — the artifact's *description* of the architecture, workflow,
   tech stack, or conventions no longer matches the code, even when every path still
   resolves. This is the harder, higher-value class.
+- **Legacy narration** (forward-looking drift) — the artifact is accurate but carries
+  superseded-history framing it shouldn't ("Use Laravel Sail (previously Herd)", "X
+  replaced Y", housekeeping "Updated &lt;date&gt;: previously…"). A steering doc
+  should state the current reality only; the fix strips the history while keeping any
+  genuine removal-guard, provenance ref, or "instead of" comparison. The softest
+  class, but it quietly makes every session read migration backstory.
 
 Arguments (`$ARGUMENTS`):
 - `--user` — also audit `~/.claude` artifacts (separate, clearly-marked section).
 - `--changed` — only audit artifacts changed since the last commit (`git diff`),
   for cheap re-runs.
+- `--forward-only` — spotlight only the **Legacy narration** class: a focused
+  forward-looking cleanup that reports the ⚪ band alone (broken/stale findings are
+  suppressed). Use when the goal is to make artifacts read present-tense, not to
+  chase broken references.
 - `--apply` — apply accepted fixes without a second prompt.
 - a path — audit a different project directory instead of `$CLAUDE_PROJECT_DIR`.
 
@@ -58,7 +68,12 @@ Prioritize and budget — don't blindly spawn dozens:
   and tell the user how many low/none remain and offer to continue.
 
 Each auditor reasons about the artifact against the real code and returns findings
-(reference + context drift) with evidence and an exact `old → new` edit.
+(reference, context, and legacy-narration drift) with evidence and an exact
+`old → new` edit.
+
+If `--forward-only` was passed, tell each auditor in its prompt to focus on the
+**Legacy narration** class and skip reference/context findings — the goal is a
+present-tense cleanup, not a reference hunt.
 
 ## Step 3 — Synthesize the report (by reasoning)
 
@@ -68,6 +83,9 @@ confidence. Group:
 - 🔴 **Broken** — a reference resolves to nothing.
 - 🟠 **Stale** — context drift: the description contradicts the current code.
 - 🟡 **Outdated / low-confidence** — likely stale, weaker evidence.
+- ⚪ **Legacy narration** — accurate but carries superseded-history framing; the fix
+  strips the history to leave a forward-looking instruction. Always list this band
+  last (softest severity). With `--forward-only`, show only this band.
 
 For each finding show: the artifact (relative path), the claim, the reality, the
 evidence (`file:line`), and the proposed edit. Keep project-scope and `--user`
@@ -96,3 +114,8 @@ needs manual attention.
   This judgment is the whole point of using subagents instead of a script.
 - Context drift is the headline: an artifact with zero broken paths can still be
   badly out of date. Always have the auditor read the code, not just check paths.
+- Legacy narration is about clarity, not correctness: the instruction is right, but a
+  steering doc should read present-tense. Strip the migration story — but keep
+  provenance refs (bug/PR/date), genuine removal-guards (rephrased forward), and
+  "instead of" comparisons, and leave true historical records (CHANGELOG, ADRs)
+  alone. That keep/strip judgment is the reason this runs through a reasoning agent.

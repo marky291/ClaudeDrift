@@ -37,9 +37,15 @@ You are given a `projectDir` (and optionally `--user` to also include
 
 4. **Triage each artifact by drift-likelihood** with a quick reasoned glance (not a
    full audit): does it obviously reference things that moved/renamed? Does its
-   described architecture/stack/workflow look stale vs what you saw? Rate each
-   `high` / `medium` / `low` / `none` and say why in one line. This ordering lets
-   the orchestrator spend the expensive deep audits where they matter.
+   described architecture/stack/workflow look stale vs what you saw? Also weigh
+   **legacy-narration density** — an artifact thick with "previously / replaced / used
+   to / we moved from / Updated &lt;date&gt;:" framing can be perfectly accurate yet
+   still need a forward-looking cleanup, so don't rate it `none` on path-accuracy
+   alone. (Exempt artifacts whose *role* is a historical record — CHANGELOG, ADRs,
+   release notes; for those, past-tense narration is the point.) Rate each `high` /
+   `medium` / `low` / `none` and say why in one line (note if the driver is legacy
+   narration). This ordering lets the orchestrator spend the expensive deep audits
+   where they matter.
 
 ## Output — return ONLY this JSON
 

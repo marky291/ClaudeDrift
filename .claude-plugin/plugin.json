@@ -1,8 +1,8 @@
 {
   "name": "claude-drift",
   "displayName": "ClaudeDrift",
-  "version": "0.6.0",
-  "description": "Detects and fixes drift between a project's Claude artifacts (CLAUDE.md, skills, commands, agents, hooks/settings) and the project's actual current reality.",
+  "version": "0.7.0",
+  "description": "Detects and fixes drift between a project's Claude artifacts (CLAUDE.md, skills, commands, agents, hooks/settings) and the project's actual current reality: broken references, stale context, and legacy-narration framing that should read forward-looking.",
   "author": {
     "name": "Mark Hester",
     "email": "markhester.dev+anthropic@pm.me"
@@ -13,6 +13,8 @@
     "skills",
     "maintenance",
     "audit",
-    "context"
+    "context",
+    "forward-looking",
+    "legacy-narration"
   ]
 }

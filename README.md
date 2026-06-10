@@ -4,7 +4,7 @@
 
 ### Your `CLAUDE.md`, skills, and agents rot as your code changes. ClaudeDrift reasons out where — and fixes it.
 
-[![version](https://img.shields.io/badge/version-0.6.0-blue)](https://github.com/marky291/ClaudeDrift/releases)
+[![version](https://img.shields.io/badge/version-0.7.0-blue)](https://github.com/marky291/ClaudeDrift/releases)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-8A63D2)](https://code.claude.com/docs/en/plugins)
 [![reasoning](https://img.shields.io/badge/engine-reasoning%2C%20not%20regex-brightgreen)](./agents)
 [![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
@@ -34,14 +34,17 @@ context produces wrong work — quietly, every session.
 your actual codebase, shows you exactly where they've drifted, and offers to fix
 them.** Run it on demand.
 
-## Two kinds of drift it catches
+## Three kinds of drift it catches
 
 | | |
 |---|---|
 | 🔗 **Reference drift** | A path, command, or script an artifact names no longer exists. |
 | 🧠 **Context drift** | The *description* of your architecture, workflow, tech stack, or conventions no longer matches the code — **even when every file path still resolves** ("we use Redux" → you're on Zustand). |
+| 🧭 **Legacy narration** | The artifact is *accurate*, but carries superseded-history framing a steering doc shouldn't — "Use Laravel Sail (previously Herd)", "X replaced Y", "Updated &lt;date&gt;: previously…". It should state today's reality, not the migration path that led there. |
 
-Most tools can only do the first. The second is where the real damage hides.
+Most tools can only do the first. The second and third are where the real damage
+hides — context that's subtly wrong, or live instructions buried under migration
+backstory Claude re-reads every session.
 
 ## Reasoning, not regex
 
@@ -93,6 +96,15 @@ and still got them wrong at the edges. The reasoning agents got every one right 
 > (lowercase). Works on the maintainer's Mac; **breaks the moment it runs in Linux
 > CI** (case-sensitive filesystem). Surfaced as a real, actionable finding.
 
+> **Forward-looking, enforced.** A `CLAUDE.md` said "Local dev uses Laravel Sail
+> (previously Herd)" and a skill carried "Updated 2026-04: this step previously used
+> the old API." Both were *accurate* — every path resolved — but each forced Claude
+> to read a migration story to act on the present. ClaudeDrift flagged the history
+> framing and proposed the present-tense rewrite, while deliberately leaving a nearby
+> "don't recreate the old `vendor/` junction" guard (a real instruction) and a
+> `(Bug 96280)` provenance tag untouched. Knowing which history to cut and which to
+> keep is the judgment, and the reason this is a reasoning agent.
+
 > **A false alarm, *not* raised.** `CLAUDE.md` mentioned "deploy/pulse" in a prose
 > list of subsystem names, and `deploy/` is a real directory. A scanner flags it.
 > ClaudeDrift read the sentence, saw it was a name and not a path, and stayed quiet.
@@ -113,12 +125,14 @@ Three reasoning passes, orchestrated by the `/claude-drift:drift-check` command:
    whether dependencies are installed, and ranks each artifact by how likely it has
    drifted — so the deep audit is **prioritized, not 50 blind agents**.
 2. **Audit** — a **`drift-auditor`** subagent reasons about each artifact against the
-   real code (reference *and* context drift), returning evidenced findings with an
-   exact `old → new` fix. It judges, on the spot, what's a real claim vs an example,
-   a sub-package path, or prose.
+   real code (reference, context, *and* legacy-narration drift), returning evidenced
+   findings with an exact `old → new` fix. It judges, on the spot, what's a real claim
+   vs an example, a sub-package path, or prose — and, for legacy narration, what
+   history to strip vs. keep (provenance refs, genuine removal-guards, and true
+   historical records like CHANGELOGs are left alone).
 3. **Synthesize & apply** — the command merges and ranks the findings, shows you a
-   report grouped 🔴 Broken / 🟠 Stale / 🟡 Outdated with evidence, and offers to
-   apply the fixes (then re-verifies them).
+   report grouped 🔴 Broken / 🟠 Stale / 🟡 Outdated / ⚪ Legacy narration with
+   evidence, and offers to apply the fixes (then re-verifies them).
 
 **Source of truth is your codebase.** When an artifact and the code disagree, the
 artifact is what's wrong — ClaudeDrift never edits your code.
@@ -133,11 +147,12 @@ artifact is what's wrong — ClaudeDrift never edits your code.
 ## Usage
 
 ```
-/claude-drift:drift-check                # audit the current project
-/claude-drift:drift-check --user         # also audit ~/.claude artifacts
-/claude-drift:drift-check --changed      # only audit artifacts changed since last commit
-/claude-drift:drift-check --apply        # apply fixes without re-prompting
-/claude-drift:drift-check /path/to/proj  # audit a different project directory
+/claude-drift:drift-check                  # audit the current project
+/claude-drift:drift-check --user           # also audit ~/.claude artifacts
+/claude-drift:drift-check --changed        # only audit artifacts changed since last commit
+/claude-drift:drift-check --forward-only   # forward-looking pass: report only legacy-narration drift
+/claude-drift:drift-check --apply          # apply fixes without re-prompting
+/claude-drift:drift-check /path/to/proj    # audit a different project directory
 ```
 
 ## Install
