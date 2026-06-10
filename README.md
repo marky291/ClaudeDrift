@@ -105,6 +105,16 @@ and still got them wrong at the edges. The reasoning agents got every one right 
 > `(Bug 96280)` provenance tag untouched. Knowing which history to cut and which to
 > keep is the judgment, and the reason this is a reasoning agent.
 
+> **Memory that outlived the code.** Claude's native auto-memory recorded a project
+> note — "the login regression fix lives in `AuthGuard.tsx::validateSession`" — written
+> when it was true. Three months later the guard had been extracted to
+> `auth/sessionValidator.ts` and the method renamed, so every session Claude recalled a
+> file/function pair that no longer existed. ClaudeDrift read the memory body, resolved
+> the claim against the real tree, flagged the dead reference with the current location
+> as the fix — and, crucially, left an *unresolved* `[[oauth-migration]]` cross-link
+> alone (the memory system allows links to not-yet-written memories; a regex flagging
+> it would be wrong). Memory is rarely revised, so this is exactly where drift hides.
+>
 > **A false alarm, *not* raised.** `CLAUDE.md` mentioned "deploy/pulse" in a prose
 > list of subsystem names, and `deploy/` is a real directory. A scanner flags it.
 > ClaudeDrift read the sentence, saw it was a name and not a path, and stayed quiet.
