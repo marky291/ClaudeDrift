@@ -3,6 +3,43 @@
 All notable changes to ClaudeDrift are documented here. This project follows
 [semantic versioning](https://semver.org/).
 
+## [0.8.0] — Memory-aware drift
+
+**New artifact class.** ClaudeDrift now audits a project's **memory systems**, which
+steer Claude just like a `CLAUDE.md` and drift just as quietly — auto-memory records
+"what was true when written" and is rarely revised, so its references rot. Crucially,
+ClaudeDrift does **not** hardcode which memory systems exist: the flow-mapper *infers*
+them from the project's own artifacts and MCP config, so it covers whatever a given
+project actually uses.
+
+Two flavours, both audited from files alone (no new runtime, no live MCP calls — the
+zero-always-on-server footprint is unchanged):
+- **Native file memory** — `~/.claude/projects/<sanitized-projectDir>/memory/MEMORY.md`
+  + topic files. The auditor checks index pointers (`- [Title](file.md)`) resolve to
+  real topic files, frontmatter is well-formed (`name`/`description`/`metadata.type`),
+  and — the headline — body claims that name a file/function/flag/table still match the
+  code. (An *unresolved* `[[name]]` cross-link is deliberately NOT flagged; the memory
+  system allows links to not-yet-written memories.)
+- **MCP-backed memory** — any memory/knowledge MCP server (qdrant, mem0, chroma, …).
+  No files to read, but a doc that routes work to a memory tool no longer declared in
+  `.mcp.json`/settings is caught as a broken reference.
+
+### Added
+- **Memory-system discovery** in `claude-flow-mapper` — derives the native memory dir
+  from the project path (separators/`:` → `-`, with an `ls ~/.claude/projects/*/memory/`
+  fallback), classifies memory MCP servers from `.mcp.json`/settings, returns a new
+  `memorySystems` list, and emits native memory files as `type: "memory"` artifacts
+  (rated with a higher baseline drift-likelihood, since memory is rarely revised).
+- **Memory-specific audit rules** in `drift-auditor` — index↔file resolution, body
+  file/function/flag verification, frontmatter checks, cross-layer pointer checks, and
+  MCP-tool-vs-config reference checks; unresolved `[[links]]` are explicitly exempt.
+- **"Memory systems detected"** line in the `drift-check` report so the user sees what
+  was covered; memory findings slot into the existing 🔴/🟠/🟡 severity bands.
+
+### Changed
+- README "What it audits", plugin/marketplace descriptions, and the skill description
+  updated to include native and MCP memory.
+
 ## [0.7.0] — Legacy narration (forward-looking drift)
 
 **New drift class.** ClaudeDrift now catches a third kind of drift: **legacy

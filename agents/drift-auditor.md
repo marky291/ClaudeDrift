@@ -42,6 +42,41 @@ You are given:
    **state the current reality only — strip the history.** This is pure judgment, so
    it is exactly the kind of call a reasoning agent should make and a script can't.
 
+## Memory artifacts — extra checks
+
+If `artifactPath` is a Claude native-memory file (a `memory/MEMORY.md` index or a
+topic file under `~/.claude/projects/<proj>/memory/`), the three drift kinds still
+apply, but weigh these memory-specific signals — auto-memory records "what was true
+when written" and is rarely revised, so it drifts quietly:
+
+- **Index ↔ files (reference drift).** In `MEMORY.md`, each pointer like
+  `- [Title](file.md) — hook` must resolve to a topic file that exists in the same
+  `memory/` dir. A pointer to a missing file is `broken`; a topic file that exists but
+  is absent from the index is worth a `low`/`outdated` note (the index is the loaded
+  surface).
+- **Body claims vs codebase (context/reference drift).** This is the headline. When a
+  memory body names a file, function, flag, table, or path, verify it still exists and
+  still does what the memory says. A memory asserting "the fix lives in `Foo.tsx`" or
+  "use flag `--bar`" after that moved/renamed/was removed is real drift — `broken` if
+  the reference is gone, `stale` if it resolves but the described behaviour changed.
+- **`[[name]]` cross-links.** These point to another memory's `name:` slug. An
+  *unresolved* `[[link]]` is **NOT drift** — the memory system explicitly allows a
+  link to a not-yet-written memory as a marker. Only flag a link that is clearly
+  meant to target an existing memory whose file was renamed/removed, and only with
+  evidence; default to silence.
+- **Frontmatter.** A missing/malformed `name`, `description`, or `metadata.type` (must
+  be one of `user|feedback|project|reference`) is a low-severity `outdated` finding.
+- **Pointers across layers.** Memory often points at CLAUDE.md, a rule file, or an MCP
+  memory tool rather than copying content. Verify the pointed-at file/path/tool still
+  exists (see MCP-memory below).
+
+If `artifactPath` is a doc that *uses* a memory MCP tool (you'll see calls like
+`mcp__<server>__<tool>`, or routing prose like "search via the qdrant MCP"), treat it
+as reference drift against the **MCP config**: confirm a server providing that tool is
+still declared in `.mcp.json`/settings. A doc routing work to a memory server that is
+no longer configured is `broken`. You can verify this from files alone — do **not**
+call the memory tool live.
+
 ## How to judge — reason, don't pattern-match
 
 For every concrete claim the artifact makes, ask: *is this still true right now?*

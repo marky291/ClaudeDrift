@@ -1,6 +1,6 @@
 ---
 name: drift-check
-description: Audit this project's Claude artifacts (CLAUDE.md, skills, commands, agents, hooks/settings, .mcp.json) for drift from the project's actual reality — both broken references AND context drift (stale architecture/workflow/convention descriptions) — using Claude's reasoning via subagents, then produce a ranked report and offer to apply fixes.
+description: Audit this project's Claude artifacts (CLAUDE.md, skills, commands, agents, hooks/settings, .mcp.json, and native/MCP memory) for drift from the project's actual reality — both broken references AND context drift (stale architecture/workflow/convention descriptions) — using Claude's reasoning via subagents, then produce a ranked report and offer to apply fixes.
 argument-hint: "[--user] [--apply] [--changed] [path]"
 user-invocable: true
 disable-model-invocation: true
@@ -45,7 +45,12 @@ current working directory.
 Spawn the **`claude-flow-mapper`** subagent (Task tool, `subagent_type:
 "claude-flow-mapper"`) on the project dir (pass `--user` if given). It returns the
 artifact inventory, a `projectReality` grounding summary, install-state caveats,
-and a `driftLikelihood` rating per artifact.
+a `driftLikelihood` rating per artifact, and a `memorySystems` list — the memory
+systems it inferred from the project's own artifacts + MCP config (native file
+memory under `~/.claude/projects/<proj>/memory/` and/or memory MCP servers). Native
+memory files come back as normal artifacts of `type: "memory"` and are audited like
+any other; MCP-backed memory has no files, so its drift is caught when docs that
+route to it are audited against the MCP config.
 
 If it finds no Claude artifacts, say so and stop. If `installState` has caveats
 (deps not installed, submodule uninitialized), surface them first — note that
@@ -92,6 +97,12 @@ evidence (`file:line`), and the proposed edit. Keep project-scope and `--user`
 scope in separate sections. End with per-severity counts; if there are no findings,
 report "✅ No significant drift detected." Optionally write the report to
 `.claude/drift-report.md`.
+
+If `memorySystems` came back from Step 1, add a one-line "Memory systems detected"
+note to the report (e.g. "native auto-memory (12 topic files) + qdrant MCP") so the
+user can see what was covered. Memory findings themselves slot into the normal
+severity bands; flag a memory file naming a moved/removed file/function as 🔴/🟠 just
+like any other artifact.
 
 ## Step 4 — Offer to apply fixes
 

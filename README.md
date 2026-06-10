@@ -4,7 +4,7 @@
 
 ### Your `CLAUDE.md`, skills, and agents rot as your code changes. ClaudeDrift reasons out where — and fixes it.
 
-[![version](https://img.shields.io/badge/version-0.7.0-blue)](https://github.com/marky291/ClaudeDrift/releases)
+[![version](https://img.shields.io/badge/version-0.8.0-blue)](https://github.com/marky291/ClaudeDrift/releases)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-8A63D2)](https://code.claude.com/docs/en/plugins)
 [![reasoning](https://img.shields.io/badge/engine-reasoning%2C%20not%20regex-brightgreen)](./agents)
 [![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
@@ -142,6 +142,12 @@ artifact is what's wrong — ClaudeDrift never edits your code.
 - `CLAUDE.md` files (including nested ones)
 - `.claude/skills/*/SKILL.md`, `.claude/commands/**/*.md`, `.claude/agents/*.md`
 - `.claude/settings.json`, `settings.local.json`, hooks, `.mcp.json`
+- **Memory** — whichever memory systems the project actually uses, discovered from
+  its own artifacts and MCP config (not hardcoded): Claude's native file memory
+  (`~/.claude/projects/<proj>/memory/MEMORY.md` + topic files — index pointers,
+  frontmatter, and body file/function/flag claims checked against the code) and any
+  memory MCP server (a doc that routes work to a memory tool no longer in `.mcp.json`
+  is caught as a broken reference). No live MCP calls — it audits from files alone.
 - With `--user`: the same artifacts under `~/.claude`
 
 ## Usage
